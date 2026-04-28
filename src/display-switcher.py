@@ -155,6 +155,9 @@ class DisplaySwitcher(Gtk.Window):
         self.set_skip_taskbar_hint(True)
         self.set_skip_pager_hint(True)
 
+        # CRITICAL: Layer-shell MUST be initialized BEFORE window is realized/shown
+        self.setup_layer_shell()
+
         # Load CSS
         self.load_css()
 
@@ -168,15 +171,15 @@ class DisplaySwitcher(Gtk.Window):
         self.current_mode = self.load_current_mode()
         self.selected_index = self.get_next_mode_index()
 
-        # Setup UI
+        # Setup UI (build but don't show yet)
         self.build_ui()
 
         # Setup keyboard handling
         self.connect("key-press-event", self.on_key_press)
         self.connect("destroy", self.on_destroy)
 
-        # Setup layer-shell
-        self.setup_layer_shell()
+        # Now show the window (after layer-shell is configured)
+        self.show_all()
 
         # Setup timeout timer
         self.timeout_id: Optional[int] = None
@@ -392,7 +395,6 @@ class DisplaySwitcher(Gtk.Window):
         overlay.pack_start(center_box, True, True, 0)
 
         self.add(overlay)
-        self.show_all()
 
     def on_key_press(self, widget: Gtk.Widget, event: Gdk.EventKey) -> bool:
         """Handle keyboard input"""
