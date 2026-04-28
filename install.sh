@@ -51,12 +51,7 @@ echo ""
 echo "Add this to your ~/.config/hypr/keybindings.conf (if not already present):"
 echo "  bindd = \$mainMod, O, Toggle display mode, exec, python3 ~/.local/bin/display-switcher.py"
 echo ""
-echo "Window rules added/verified in ~/.config/hypr/windowrules.conf:"
-echo "  windowrule = float, ^(display-switcher)\$"
-echo "  windowrule = center, ^(display-switcher)\$"
-echo "  windowrule = noanim, ^(display-switcher)\$"
-echo "  windowrule = noborder, ^(display-switcher)\$"
-echo "  windowrule = noshadow, ^(display-switcher)\$"
+echo "Note: Window rules not needed for layer-shell overlay"
 echo ""
 
 # Check for dependencies
