@@ -1,11 +1,25 @@
 #!/bin/bash
 # display-apply.sh - Apply display configuration modes for Hyprland
+# Uses exact resolutions from user's monitors.conf
 
-set -euo pipefail
+set -uo pipefail
 
 # Mode state file
 STATE_FILE="$HOME/.local/state/display-mode"
 NOTIFY_APP="Display Switcher"
+LOG_FILE="$HOME/.local/state/display-switcher.log"
+
+# Monitor definitions (exact from user's display-toggle.sh)
+MONITOR="DP-2"
+TV="HDMI-A-1"
+MONITOR_RES="3440x1440@74.98"
+TV_RES="3840x2160@120"
+TV_SCALE="1.5"
+
+# Logging
+log() {
+    echo "[$(date '+%Y-%m-%d %H:%M:%S')] $*" >> "$LOG_FILE"
+}
 
 # Get current mode
 get_current_mode() {
@@ -25,8 +39,36 @@ save_mode() {
 
 # Send notification
 notify() {
+    local msg="$1"
     local urgency="${2:-normal}"
-    notify-send -a "$NOTIFY_APP" -u "$urgency" "$1"
+    notify-send -a "$NOTIFY_APP" -u "$urgency" "$msg" 2>> "$LOG_FILE" || true
+}
+
+# Migrate workspaces from one monitor to another before disabling
+migrate_workspaces() {
+    local from_monitor="$1"
+    local to_monitor="$2"
+    
+    log "Migrating workspaces from $from_monitor to $to_monitor"
+    
+    # Check if jq is available
+    if ! command -v jq > /dev/null 2>&1; then
+        log "Warning: jq not found, skipping workspace migration"
+        return 0
+    fi
+    
+    # Get workspaces on the source monitor and move them
+    local workspaces
+    workspaces=$(hyprctl workspaces -j 2>> "$LOG_FILE" | jq -r ".[] | select(.monitor == \"$from_monitor\") | .id" 2>> "$LOG_FILE")
+    
+    if [[ -n "$workspaces" ]]; then
+        while IFS= read -r ws_id; do
+            if [[ -n "$ws_id" ]]; then
+                log "Moving workspace $ws_id from $from_monitor to $to_monitor"
+                hyprctl dispatch moveworkspacetomonitor "$ws_id" "$to_monitor" >> "$LOG_FILE" 2>&1 || true
+            fi
+        done <<< "$workspaces"
+    fi
 }
 
 # Apply monitor configuration
@@ -35,8 +77,11 @@ apply_mode() {
     local current_mode
     current_mode=$(get_current_mode)
     
+    log "Applying mode: $mode (current: $current_mode)"
+    
     # Don't reapply same mode
     if [[ "$mode" == "$current_mode" ]]; then
+        log "Already in $mode mode, skipping"
         notify "Already in $mode mode" "low"
         return 0
     fi
@@ -49,30 +94,73 @@ apply_mode() {
     
     case "$mode" in
         monitor)
-            # Disable HDMI-A-1, enable DP-2
-            hyprctl keyword monitor "HDMI-A-1,disable" > /dev/null 2>&1 || true
-            hyprctl keyword monitor "DP-2,preferred,auto,1" > /dev/null 2>&1 || true
+            # Migrate workspaces from TV to monitor before disabling
+            migrate_workspaces "$TV" "$MONITOR"
+            
+            # Disable TV, enable monitor with exact resolution
+            log "Disabling $TV, enabling $MONITOR"
+            hyprctl keyword monitor "${TV},disable" >> "$LOG_FILE" 2>&1 || {
+                log "Error: Failed to disable $TV"
+                notify "Failed to disable TV" "critical"
+                return 1
+            }
+            hyprctl keyword monitor "${MONITOR},${MONITOR_RES},0x0,1" >> "$LOG_FILE" 2>&1 || {
+                log "Error: Failed to enable $MONITOR"
+                notify "Failed to enable monitor" "critical"
+                return 1
+            }
             ;;
         
         extend)
-            # Enable both: DP-2 primary, HDMI-A-1 to the left
-            hyprctl keyword monitor "DP-2,preferred,auto,1" > /dev/null 2>&1 || true
-            hyprctl keyword monitor "HDMI-A-1,preferred,-1920x0,1" > /dev/null 2>&1 || true
+            # Enable both with exact resolutions and positioning
+            log "Enabling extended mode: $MONITOR + $TV"
+            hyprctl keyword monitor "${MONITOR},${MONITOR_RES},0x0,1" >> "$LOG_FILE" 2>&1 || {
+                log "Error: Failed to configure $MONITOR"
+                notify "Failed to configure monitor" "critical"
+                return 1
+            }
+            hyprctl keyword monitor "${TV},${TV_RES},-2560x0,${TV_SCALE},bitdepth,10" >> "$LOG_FILE" 2>&1 || {
+                log "Error: Failed to configure $TV"
+                notify "Failed to configure TV" "critical"
+                return 1
+            }
             ;;
         
         mirror)
-            # Mirror DP-2 to HDMI-A-1
-            hyprctl keyword monitor "DP-2,preferred,auto,1" > /dev/null 2>&1 || true
-            hyprctl keyword monitor "HDMI-A-1,preferred,auto,1,mirror,DP-2" > /dev/null 2>&1 || true
+            # Enable monitor, mirror to TV with exact resolutions
+            log "Enabling mirror mode: $MONITOR -> $TV"
+            hyprctl keyword monitor "${MONITOR},${MONITOR_RES},0x0,1" >> "$LOG_FILE" 2>&1 || {
+                log "Error: Failed to configure $MONITOR"
+                notify "Failed to configure monitor" "critical"
+                return 1
+            }
+            hyprctl keyword monitor "${TV},${TV_RES},auto,${TV_SCALE},bitdepth,10,mirror,${MONITOR}" >> "$LOG_FILE" 2>&1 || {
+                log "Error: Failed to mirror $TV"
+                notify "Failed to mirror TV" "critical"
+                return 1
+            }
             ;;
         
         tv)
-            # Disable DP-2, enable HDMI-A-1
-            hyprctl keyword monitor "DP-2,disable" > /dev/null 2>&1 || true
-            hyprctl keyword monitor "HDMI-A-1,preferred,auto,1" > /dev/null 2>&1 || true
+            # Migrate workspaces from monitor to TV before disabling
+            migrate_workspaces "$MONITOR" "$TV"
+            
+            # Disable monitor, enable TV with exact resolution
+            log "Disabling $MONITOR, enabling $TV"
+            hyprctl keyword monitor "${MONITOR},disable" >> "$LOG_FILE" 2>&1 || {
+                log "Error: Failed to disable $MONITOR"
+                notify "Failed to disable monitor" "critical"
+                return 1
+            }
+            hyprctl keyword monitor "${TV},${TV_RES},0x0,${TV_SCALE},bitdepth,10" >> "$LOG_FILE" 2>&1 || {
+                log "Error: Failed to enable $TV"
+                notify "Failed to enable TV" "critical"
+                return 1
+            }
             ;;
         
         *)
+            log "Error: Unknown mode: $mode"
             notify "Unknown mode: $mode" "critical"
             return 1
             ;;
@@ -80,6 +168,7 @@ apply_mode() {
     
     # Save state
     save_mode "$mode"
+    log "Mode saved: $mode"
     
     # Confirm notification
     notify "Display mode: $mode"
@@ -90,19 +179,36 @@ apply_mode() {
 
 # Restart waybar
 restart_waybar() {
-    # Try graceful reload first
+    log "Restarting waybar..."
+    
     if pgrep -x waybar > /dev/null 2>&1; then
-        killall -SIGUSR2 waybar > /dev/null 2>&1 || true
+        # Try graceful reload first (SIGUSR2)
+        log "Sending SIGUSR2 to waybar"
+        if killall -SIGUSR2 waybar >> "$LOG_FILE" 2>&1; then
+            sleep 1
+            
+            # Check if waybar is still running after reload
+            if pgrep -x waybar > /dev/null 2>&1; then
+                log "Waybar reloaded successfully"
+                return 0
+            else
+                log "Waybar crashed after reload, restarting..."
+            fi
+        else
+            log "SIGUSR2 reload failed, trying full restart..."
+        fi
+        
+        # Fallback: kill and restart
+        log "Killing waybar"
+        killall waybar >> "$LOG_FILE" 2>&1 || true
         sleep 0.5
         
-        # Check if waybar is still running
-        if ! pgrep -x waybar > /dev/null 2>&1; then
-            # Restart if it crashed or didn't reload
-            (sleep 1 && waybar &)
-        fi
+        log "Starting waybar"
+        waybar >> "$LOG_FILE" 2>&1 &
     else
         # Start waybar if not running
-        waybar &
+        log "Waybar not running, starting..."
+        waybar >> "$LOG_FILE" 2>&1 &
     fi
 }
 
