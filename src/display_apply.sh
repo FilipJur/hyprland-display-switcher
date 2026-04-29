@@ -113,8 +113,11 @@ apply_mode() {
     
     case "$mode" in
         monitor)
-            hyprctl keyword monitor "${TV},disable" 2>/dev/null || true
+            # Enable target monitor FIRST, then disable old one
+            # Prevents zero-monitor state which crashes Hyprland
             hyprctl keyword monitor "${MONITOR},${MONITOR_RES},0x0,1"
+            sleep 0.3
+            hyprctl keyword monitor "${TV},disable" 2>/dev/null || true
             ;;
         extend)
             hyprctl keyword monitor "${MONITOR},${MONITOR_RES},0x0,1"
@@ -125,8 +128,11 @@ apply_mode() {
             hyprctl keyword monitor "${TV},${TV_RES},auto,${TV_SCALE},bitdepth,${BITDEPTH},mirror,${MONITOR}"
             ;;
         tv)
-            hyprctl keyword monitor "${MONITOR},disable" 2>/dev/null || true
+            # Enable target monitor FIRST, then disable old one
+            # Prevents zero-monitor state which crashes Hyprland
             hyprctl keyword monitor "${TV},${TV_RES},0x0,${TV_SCALE},bitdepth,${BITDEPTH}"
+            sleep 0.3
+            hyprctl keyword monitor "${MONITOR},disable" 2>/dev/null || true
             ;;
         *)
             log "ERROR: Unknown mode: $mode"
