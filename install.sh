@@ -1,5 +1,6 @@
 #!/bin/bash
-# install.sh - Install Hyprland Display Switcher
+# install.sh - Install Hyprland Display Switcher (MVP)
+# Creates symlinks for development
 
 set -euo pipefail
 
@@ -8,83 +9,59 @@ BIN_DIR="$HOME/.local/bin"
 CONFIG_DIR="$HOME/.config/hypr"
 STATE_DIR="$HOME/.local/state"
 
-echo "Installing Hyprland Display Switcher..."
+echo "Installing Hyprland Display Switcher (MVP)..."
 
 # Create directories
 mkdir -p "$BIN_DIR"
 mkdir -p "$CONFIG_DIR"
 mkdir -p "$STATE_DIR"
 
-# Backup old toggle script if exists
-if [[ -f "$BIN_DIR/display-toggle.sh" && ! -f "$BIN_DIR/display-toggle.sh.bak" ]]; then
-    echo "Backing up old display-toggle.sh to display-toggle.sh.bak"
-    mv "$BIN_DIR/display-toggle.sh" "$BIN_DIR/display-toggle.sh.bak"
+# Remove old standalone copies if they exist (not symlinks)
+if [[ -f "$BIN_DIR/display-switcher.py" && ! -L "$BIN_DIR/display-switcher.py" ]]; then
+    echo "Removing old standalone display-switcher.py"
+    rm -f "$BIN_DIR/display-switcher.py"
+fi
+if [[ -f "$BIN_DIR/display-apply.sh" && ! -L "$BIN_DIR/display-apply.sh" ]]; then
+    echo "Removing old standalone display-apply.sh"
+    rm -f "$BIN_DIR/display-apply.sh"
 fi
 
-# Install scripts
-install -m 755 "$SCRIPT_DIR/src/display-switcher.py" "$BIN_DIR/display-switcher.py"
-install -m 755 "$SCRIPT_DIR/src/display-apply.sh" "$BIN_DIR/display-apply.sh"
+# Create symlinks (dev mode)
+ln -sf "$SCRIPT_DIR/src/display_switcher.py" "$BIN_DIR/display-switcher.py"
+ln -sf "$SCRIPT_DIR/src/display_apply.sh" "$BIN_DIR/display-apply.sh"
+chmod +x "$SCRIPT_DIR/src/display_switcher.py"
+chmod +x "$SCRIPT_DIR/src/display_apply.sh"
 
 # Install CSS config if not exists
 if [[ ! -f "$CONFIG_DIR/display-switcher.css" ]]; then
     install -m 644 "$SCRIPT_DIR/config/display-switcher.css" "$CONFIG_DIR/display-switcher.css"
-    echo "Installed default CSS config to $CONFIG_DIR/display-switcher.css"
+    echo "Installed default CSS config"
 else
-    echo "CSS config already exists at $CONFIG_DIR/display-switcher.css (not overwritten)"
+    echo "CSS config already exists (not overwritten)"
 fi
 
 echo ""
-echo "Installed:"
-echo "  $BIN_DIR/display-switcher.py"
-echo "  $BIN_DIR/display-apply.sh"
+echo "Installed (symlinks):"
+echo "  $BIN_DIR/display-switcher.py -> src/display_switcher.py"
+echo "  $BIN_DIR/display-apply.sh -> src/display_apply.sh"
 echo ""
 
-# Check for duplicate keybinding
-echo "Checking keybindings.conf..."
-if grep -v '^\s*#' "$CONFIG_DIR/keybindings.conf" 2>/dev/null | grep -q "display-toggle.sh"; then
-    echo "WARNING: Old display-toggle.sh binding still found in keybindings.conf"
-    echo "  Please comment out or remove:"
-    echo "    bindd = \$mainMod, O, ... display-toggle.sh"
-fi
-
-echo ""
-echo "Add this to your ~/.config/hypr/keybindings.conf (if not already present):"
-echo "  bindd = \$mainMod, O, Toggle display mode, exec, python3 ~/.local/bin/display-switcher.py"
-echo ""
-echo "Note: Window rules not needed for layer-shell overlay"
+# Check keybinding
+echo "Ensure this is in ~/.config/hypr/keybindings.conf:"
+echo '  bindd = $mainMod, O, Toggle display mode, exec, python3 ~/.local/bin/display-switcher.py'
 echo ""
 
-# Check for dependencies
-missing_deps=()
+# Check deps
+missing=()
+if ! command -v python3 >/dev/null 2>&1; then missing+=("python3"); fi
+if ! python3 -c "import gi" 2>/dev/null; then missing+=("python-gobject"); fi
+if ! command -v hyprctl >/dev/null 2>&1; then missing+=("hyprland"); fi
+if ! python3 -c "import gi; gi.require_version('GtkLayerShell', '0.1')" 2>/dev/null; then missing+=("gtk-layer-shell"); fi
 
-if ! command -v python3 &> /dev/null; then
-    missing_deps+=("python3")
-fi
-
-if ! python3 -c "import gi" &> /dev/null; then
-    missing_deps+=("python3-gi (PyGObject)")
-fi
-
-if ! command -v hyprctl &> /dev/null; then
-    missing_deps+=("hyprland")
-fi
-
-if ! python3 -c "import gi; gi.require_version('GtkLayerShell', '0.1'); from gi.repository import GtkLayerShell" &> /dev/null; then
-    missing_deps+=("gtk-layer-shell")
-fi
-
-if ! command -v jq &> /dev/null; then
-    missing_deps+=("jq")
-fi
-
-if [[ ${#missing_deps[@]} -gt 0 ]]; then
-    echo "WARNING: Missing dependencies:"
-    printf '  - %s\n' "${missing_deps[@]}"
-    echo ""
-    echo "On Arch Linux, install with:"
-    echo "  sudo pacman -S python python-gobject gtk3 gtk-layer-shell jq"
+if [[ ${#missing[@]} -gt 0 ]]; then
+    echo "WARNING: Missing dependencies: ${missing[*]}"
+    echo "On Arch: sudo pacman -S python python-gobject gtk3 gtk-layer-shell"
 fi
 
 echo ""
 echo "Installation complete!"
-echo "Press Super+O to test the display switcher."
