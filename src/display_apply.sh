@@ -6,6 +6,7 @@ set -uo pipefail
 
 MODE="${1:-monitor}"
 LOG_FILE="$HOME/.local/state/display-switcher.log"
+LOCK_FILE="$HOME/.local/state/display-apply.lock"
 FORCE_8BIT="${DISPLAY_SWITCHER_8BIT:-1}"  # Default 8-bit for stability
 
 # Monitor config
@@ -26,26 +27,65 @@ log() {
     echo "[$(date '+%Y-%m-%d %H:%M:%S')] $*" | tee -a "$LOG_FILE"
 }
 
-# Verify monitors match expected mode
+# Simple lock file (PID-based) to prevent concurrent execution
+acquire_lock() {
+    local max_age=30  # seconds
+    
+    if [[ -f "$LOCK_FILE" ]]; then
+        local old_pid
+        old_pid=$(cat "$LOCK_FILE" 2>/dev/null || true)
+        if [[ -n "$old_pid" ]] && kill -0 "$old_pid" 2>/dev/null; then
+            log "ERROR: Another instance is already running (PID: $old_pid)"
+            exit 1
+        fi
+        log "WARNING: Stale lock file found, removing"
+        rm -f "$LOCK_FILE"
+    fi
+    
+    echo "$$" > "$LOCK_FILE"
+}
+
+release_lock() {
+    rm -f "$LOCK_FILE"
+}
+
+# Verify monitors match expected mode using text output (same as Python)
 verify_mode() {
     local expected="$1"
     local output
-    output=$(hyprctl monitors -j 2>/dev/null)
+    output=$(hyprctl monitors all 2>/dev/null)
+    
+    local -A monitors
+    local current_name=""
+    
+    while IFS= read -r line; do
+        line=$(echo "$line" | sed 's/^[[:space:]]*//')
+        
+        if [[ "$line" == Monitor* ]]; then
+            current_name=$(echo "$line" | awk '{print $2}')
+            monitors[$current_name,"disabled"]="false"
+            monitors[$current_name,"mirror"]="none"
+        elif [[ "$line" == disabled:* ]] && [[ -n "$current_name" ]]; then
+            local val
+            val=$(echo "$line" | awk -F': ' '{print $2}')
+            monitors[$current_name,"disabled"]="$val"
+        elif [[ "$line" == mirrorOf:* ]] && [[ -n "$current_name" ]]; then
+            local val
+            val=$(echo "$line" | awk -F': ' '{print $2}')
+            monitors[$current_name,"mirror"]="$val"
+        fi
+    done <<< "$output"
     
     local dp2_enabled=false
     local dp1_enabled=false
     local dp1_mirror="none"
     
-    # Parse JSON output
-    if echo "$output" | grep -q '"name": "DP-2"'; then
+    if [[ "${monitors[DP-2,"disabled"]:-true}" == "false" ]]; then
         dp2_enabled=true
     fi
-    if echo "$output" | grep -q '"name": "DP-1"'; then
+    if [[ "${monitors[DP-1,"disabled"]:-true}" == "false" ]]; then
         dp1_enabled=true
-        # Check mirror status from full output
-        if echo "$output" | grep -A 20 '"name": "DP-1"' | grep -q '"mirrorOf": "DP-2"'; then
-            dp1_mirror="DP-2"
-        fi
+        dp1_mirror="${monitors[DP-1,"mirror"]:-none}"
     fi
     
     case "$expected" in
@@ -78,7 +118,7 @@ apply_mode() {
             ;;
         extend)
             hyprctl keyword monitor "${MONITOR},${MONITOR_RES},0x0,1"
-            hyprctl keyword monitor "${TV},${TV_RES},-2560x0,${TV_SCALE},bitdepth,${BITDEPTH}"
+            hyprctl keyword monitor "${TV},${TV_RES},-3840x0,${TV_SCALE},bitdepth,${BITDEPTH}"
             ;;
         mirror)
             hyprctl keyword monitor "${MONITOR},${MONITOR_RES},0x0,1"
@@ -109,4 +149,6 @@ apply_mode() {
 
 # Main
 mkdir -p "$(dirname "$LOG_FILE")"
+acquire_lock
+trap release_lock EXIT
 apply_mode "$MODE"
