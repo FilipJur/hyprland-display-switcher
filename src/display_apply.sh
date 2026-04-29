@@ -140,6 +140,14 @@ apply_mode() {
     # Verify
     if verify_mode "$mode"; then
         log "SUCCESS: Mode $mode verified"
+        
+        # Check if waybar died during monitor transition
+        if ! pgrep -x waybar > /dev/null 2>&1; then
+            log "WARNING: Waybar not running after mode switch, restarting..."
+            waybar &
+            log "Waybar restarted (PID: $!)"
+        fi
+        
         exit 0
     else
         log "ERROR: Mode verification failed for $mode"
