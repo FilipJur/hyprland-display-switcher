@@ -1,210 +1,111 @@
 /* display-switcher.css - HyDE "Another World" Theme */
-/* Square buttons, 0px radius, medium animations, purple current indicator */
+/* Square buttons, 0px radius, purple current indicator */
 
 /* ── Backdrop ── */
 #display-switcher {
-  background: rgba(0, 0, 0, 0.65);
+    background: rgba(0, 0, 0, 0.65);
 }
 
 /* ── Card Container ── */
 #menu-container {
-  background: rgba(14, 17, 26, 0.96);
-  border: 1px solid rgba(120, 198, 235, 0.15);
-  border-radius: 0;
-  padding: 32px 40px;
-  box-shadow: 0 25px 50px rgba(0, 0, 0, 0.5);
-}
-
-/* ── Header ── */
-#header-title {
-  color: #FFFFFF;
-  font-size: 21px;
-  font-weight: 300;
-  letter-spacing: 2px;
-  margin-bottom: 8px;
-}
-
-#header-subtitle {
-  color: rgba(255, 255, 255, 0.55);
-  font-size: 11px;
-  font-weight: 400;
-  letter-spacing: 1px;
-  margin-bottom: 20px;
-}
-
-#header-divider {
-  background: rgba(120, 198, 235, 0.12);
-  min-height: 1px;
-  margin-bottom: 24px;
-}
-
-/* ── Button Grid ── */
-#button-grid {
-  margin: 0 0 24px 0;
+    background: rgba(14, 17, 26, 0.96);
+    border: 1px solid rgba(120, 198, 235, 0.15);
+    border-radius: 0;
+    padding: 32px 40px;
+    box-shadow: 0 25px 50px rgba(0, 0, 0, 0.5);
 }
 
 /* ── Mode Button (Square, 0px radius) ── */
 #mode-button {
-  background: rgba(255, 255, 255, 0.04);
-  border: 1px solid rgba(120, 198, 235, 0.12);
-  border-radius: 0;
-  padding: 16px 20px;
-  margin: 0 8px;
-  min-width: 100px;
-  min-height: 100px;
+    background: rgba(255, 255, 255, 0.04);
+    border: 1px solid rgba(120, 198, 235, 0.12);
+    border-radius: 0;
+    padding: 16px 20px;
+    margin: 0 8px;
+    min-width: 100px;
+    min-height: 100px;
 }
 
 /* Hover - highlight effect */
 #mode-button:hover {
-  background: rgba(255, 255, 255, 0.08);
-  border-color: rgba(120, 198, 235, 0.35);
-  box-shadow: 0 4px 12px rgba(0, 0, 0, 0.3);
+    background: rgba(255, 255, 255, 0.08);
+    border-color: rgba(120, 198, 235, 0.35);
+    box-shadow: 0 4px 12px rgba(0, 0, 0, 0.3);
 }
 
-/* Selected (next to apply) - cyan glow + pulse */
+/* Selected (next to apply) - cyan glow */
 #mode-button.selected {
-  background: rgba(106, 169, 201, 0.15);
-  border: 2px solid rgba(120, 198, 235, 0.9);
-  box-shadow: 0 0 25px rgba(120, 198, 235, 0.3);
+    background: rgba(106, 169, 201, 0.15);
+    border: 2px solid rgba(120, 198, 235, 0.9);
+    box-shadow: 0 0 25px rgba(120, 198, 235, 0.3);
 }
 
 /* Current (active mode) - purple border */
 #mode-button.current {
-  border: 2px solid rgba(174, 0, 243, 0.7);
-  box-shadow: 0 0 20px rgba(174, 0, 243, 0.25);
+    border: 2px solid rgba(174, 0, 243, 0.7);
+    box-shadow: 0 0 20px rgba(174, 0, 243, 0.25);
 }
 
 /* Current + Selected combo */
 #mode-button.current.selected {
-  border: 2px solid rgba(120, 198, 235, 0.9);
-  box-shadow: 0 0 25px rgba(120, 198, 235, 0.3), 0 0 20px rgba(174, 0, 243, 0.25);
+    border: 2px solid rgba(120, 198, 235, 0.9);
+    box-shadow:
+        0 0 25px rgba(120, 198, 235, 0.3),
+        0 0 20px rgba(174, 0, 243, 0.25);
 }
 
 /* ── Icon ── */
 #mode-icon {
-  color: #FFFFFF;
-  opacity: 0.6;
+    color: #ffffff;
+    opacity: 0.6;
 }
 
 #mode-button:hover #mode-icon {
-  opacity: 0.85;
+    opacity: 0.85;
 }
 
 #mode-button.selected #mode-icon {
-  color: #04ddff;
-  opacity: 1;
+    color: #04ddff;
+    opacity: 1;
 }
 
 .emoji-icon {
-  color: #FFFFFF;
-  font-size: 36px;
-  opacity: 0.8;
+    color: #ffffff;
+    font-size: 36px;
+    opacity: 0.8;
 }
 
 #mode-button:hover .emoji-icon {
-  opacity: 1;
+    opacity: 1;
 }
 
 #mode-button.selected .emoji-icon {
-  color: #04ddff;
-  opacity: 1;
+    color: #04ddff;
+    opacity: 1;
 }
 
 /* ── Label ── */
 #mode-label {
-  color: rgba(255, 255, 255, 0.55);
-  font-size: 12px;
-  font-weight: 600;
-  margin-top: 12px;
+    color: rgba(255, 255, 255, 0.55);
+    font-size: 12px;
+    font-weight: 600;
+    margin-top: 12px;
 }
 
 #mode-button:hover #mode-label {
-  color: #FFFFFF;
+    color: #ffffff;
 }
 
 #mode-button.selected #mode-label {
-  color: #04ddff;
-  font-weight: 700;
+    color: #04ddff;
+    font-weight: 700;
 }
 
 /* ── Current Indicator (Purple Dot) ── */
 #mode-indicator {
-  color: #ae00f3;
-  font-size: 14px;
-  font-weight: 700;
-  margin-bottom: 4px;
-  min-height: 14px;
-}
-
-/* ── Status Bar ── */
-#status-bar {
-  margin-top: 16px;
-  padding-top: 16px;
-  border-top: 1px solid rgba(120, 198, 235, 0.12);
-}
-
-#status-label {
-  color: rgba(255, 255, 255, 0.55);
-  font-size: 12px;
-  font-weight: 400;
-}
-
-#status-value {
-  color: #ae00f3;
-  font-size: 12px;
-  font-weight: 600;
-}
-
-/* ── Animations ── */
-@keyframes overlay-enter {
-  0% { opacity: 0; }
-  100% { opacity: 1; }
-}
-
-@keyframes selection-pulse {
-  0% { box-shadow: 0 0 20px rgba(120, 198, 235, 0.3); }
-  50% { box-shadow: 0 0 35px rgba(120, 198, 235, 0.5); }
-  100% { box-shadow: 0 0 20px rgba(120, 198, 235, 0.3); }
-}
-
-@keyframes button-stagger {
-  0% { opacity: 0; }
-  100% { opacity: 1; }
-}
-
-@keyframes timeout-warning {
-  0% { border-color: rgba(120, 198, 235, 0.15); }
-  50% { border-color: rgba(255, 80, 80, 0.5); }
-  100% { border-color: rgba(120, 198, 235, 0.15); }
-}
-
-/* Apply entry animation to card */
-.animate-enter #menu-container {
-  animation: overlay-enter 300ms ease forwards;
-}
-
-/* Stagger buttons on entry */
-.animate-enter #mode-button:nth-child(1) {
-  animation: button-stagger 250ms ease-out 100ms forwards;
-  opacity: 0;
-}
-
-.animate-enter #mode-button:nth-child(2) {
-  animation: button-stagger 250ms ease-out 150ms forwards;
-  opacity: 0;
-}
-
-.animate-enter #mode-button:nth-child(3) {
-  animation: button-stagger 250ms ease-out 200ms forwards;
-  opacity: 0;
-}
-
-.animate-enter #mode-button:nth-child(4) {
-  animation: button-stagger 250ms ease-out 250ms forwards;
-  opacity: 0;
-}
-
-/* Timeout warning (last 500ms) */
-.timeout-warning #menu-container {
-  animation: timeout-warning 500ms ease-in-out;
+    color: #ae00f3;
+    font-size: 14px;
+    font-weight: 700;
+    margin-bottom: 4px;
+    min-height: 14px;
 }
