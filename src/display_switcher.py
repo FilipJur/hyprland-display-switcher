@@ -24,13 +24,15 @@ from gi.repository import Gtk, Gdk, GLib
 
 CSS_FILE = os.path.expanduser("~/.config/hypr/display-switcher.css")
 PID_FILE = os.path.expanduser("~/.local/state/display-switcher.pid")
+COOLDOWN_FILE = os.path.expanduser("~/.local/state/display-switcher.cooldown")
+COOLDOWN_SECONDS = 8
 TIMEOUT_SECONDS = 3
 
 MODES: List[Dict[str, Any]] = [
-    {"id": "monitor", "name": "Monitor", "icon": "video-display-symbolic"},
-    {"id": "extend", "name": "Extend", "icon": "video-joined-displays-symbolic"},
-    {"id": "mirror", "name": "Mirror", "icon": "view-mirror-symbolic"},
-    {"id": "tv", "name": "TV Only", "icon": "tv-symbolic"},
+    {"id": "monitor",  "name": "Monitor",  "icon": "video-display-symbolic",        "desc": "SDR"},
+    {"id": "extend",   "name": "Extend",   "icon": "video-joined-displays-symbolic", "desc": "HDR"},
+    {"id": "mirror",   "name": "Mirror",   "icon": "view-mirror-symbolic",           "desc": "SDR"},
+    {"id": "tv",       "name": "TV",       "icon": "tv-symbolic",                    "desc": "HDR"},
 ]
 
 ICON_FALLBACKS = {
@@ -60,11 +62,13 @@ def detect_current_mode() -> str:
             parts = line.split()
             if len(parts) >= 2:
                 current_monitor = parts[1]
-                monitors[current_monitor] = {"disabled": False, "mirror": None}
+                monitors[current_monitor] = {"disabled": False, "mirror": None, "cm": "srgb"}
         elif line.startswith('disabled: ') and current_monitor:
             monitors[current_monitor]["disabled"] = (line.split(': ')[1] == "true")
         elif line.startswith('mirrorOf: ') and current_monitor:
             monitors[current_monitor]["mirror"] = line.split(': ')[1]
+        elif line.startswith('colorManagementPreset: ') and current_monitor:
+            monitors[current_monitor]["cm"] = line.split(': ')[1]
 
     dp2 = monitors.get("DP-2", {})
     dp1 = monitors.get("DP-1", {})
@@ -80,48 +84,64 @@ def detect_current_mode() -> str:
     elif dp2_enabled and dp1_enabled:
         if dp1_mirror == "DP-2":
             return "mirror"
-        else:
-            return "extend"
+        return "extend"
 
     return "monitor"  # ultimate fallback
 
 
 class ModeButton(Gtk.Box):
     def __init__(self, mode_data: Dict[str, Any]):
-        super().__init__(orientation=Gtk.Orientation.VERTICAL, spacing=8)
+        super().__init__(orientation=Gtk.Orientation.VERTICAL, spacing=4)
         self.mode_id = mode_data["id"]
 
         self.set_name("mode-button")
-        self.set_size_request(100, 100)
+        self.set_size_request(120, 140)
         self.set_halign(Gtk.Align.CENTER)
         self.set_valign(Gtk.Align.CENTER)
 
-        # Purple dot indicator
+        # Active indicator (purple dot)
         self.indicator = Gtk.Label(label="●")
         self.indicator.set_name("mode-indicator")
         self.indicator.set_no_show_all(True)
         self.indicator.hide()
 
-        # Icon
+        # Icon + text flex container
+        self.content = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
+        self.content.set_halign(Gtk.Align.CENTER)
+        self.content.set_valign(Gtk.Align.CENTER)
+        self.content.set_name("mode-content")
+
+        # Icon with fallback
         icon_name = mode_data["icon"]
         icon_theme = Gtk.IconTheme.get_default()
         if icon_theme.has_icon(icon_name):
             self.icon = Gtk.Image.new_from_icon_name(icon_name, Gtk.IconSize.DIALOG)
-            self.icon.set_pixel_size(40)
+            self.icon.set_pixel_size(48)
             self.icon.set_name("mode-icon")
         else:
             self.icon = Gtk.Label(label=ICON_FALLBACKS.get(icon_name, "🖥️"))
             self.icon.set_name("mode-icon-fallback")
             self.icon.get_style_context().add_class("emoji-icon")
+        self.icon.set_halign(Gtk.Align.CENTER)
 
         # Label
         self.label = Gtk.Label(label=mode_data["name"])
         self.label.set_name("mode-label")
         self.label.set_justify(Gtk.Justification.CENTER)
+        self.label.set_halign(Gtk.Align.CENTER)
+
+        # Description (HDR/SDR indicator)
+        self.desc = Gtk.Label(label=mode_data["desc"])
+        self.desc.set_name("mode-desc")
+        self.desc.set_justify(Gtk.Justification.CENTER)
+        self.desc.set_halign(Gtk.Align.CENTER)
+
+        self.content.pack_start(self.icon, False, False, 0)
+        self.content.pack_start(self.label, False, False, 0)
+        self.content.pack_start(self.desc, False, False, 0)
 
         self.pack_start(self.indicator, False, False, 0)
-        self.pack_start(self.icon, False, False, 0)
-        self.pack_start(self.label, False, False, 0)
+        self.pack_start(self.content, True, True, 0)
         self.show_all()
 
     def set_selected(self, selected: bool):
@@ -202,8 +222,10 @@ class DisplaySwitcher(Gtk.Window):
             background: rgba(255, 255, 255, 0.04);
             border: 1px solid rgba(120, 198, 235, 0.12);
             border-radius: 0;
-            padding: 16px;
+            padding: 20px 20px 16px 20px;
             margin: 0 8px;
+            min-width: 120px;
+            min-height: 140px;
         }
         #mode-button.selected {
             background: rgba(106, 169, 201, 0.15);
@@ -214,11 +236,18 @@ class DisplaySwitcher(Gtk.Window):
         }
         #mode-indicator {
             color: #ae00f3;
-            font-size: 10px;
+            font-size: 14px;
+            font-weight: 700;
             margin-bottom: 4px;
+            min-height: 14px;
         }
-        #mode-label { color: #FFFFFF; font-size: 12px; font-weight: 600; }
+        #mode-icon { color: #ffffff; opacity: 0.6; }
+        .emoji-icon { color: #ffffff; font-size: 40px; opacity: 0.8; }
+        #mode-label { color: rgba(255, 255, 255, 0.55); font-size: 13px; font-weight: 600; }
+        #mode-desc { color: rgba(255, 255, 255, 0.35); font-size: 10px; }
         #mode-button.selected #mode-label { color: #04ddff; font-weight: 700; }
+        #mode-button.selected #mode-icon { color: #04ddff; opacity: 1; }
+        #mode-button.selected #mode-desc { color: rgba(4, 221, 255, 0.7); }
         """
 
     def get_next_index(self) -> int:
@@ -298,6 +327,9 @@ class DisplaySwitcher(Gtk.Window):
         selected = self.buttons[self.selected_index].mode_id
         self.close()
         try:
+            # Write cooldown timestamp to prevent rapid re-invocation
+            with open(COOLDOWN_FILE, 'w') as f:
+                f.write(str(os.times().elapsed))
             script = os.path.expanduser("~/.local/bin/display-apply.sh")
             subprocess.Popen([script, selected], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         except Exception as e:
@@ -319,6 +351,18 @@ class DisplaySwitcher(Gtk.Window):
 
 
 def check_instance():
+    # Check cooldown to prevent rapid re-invocation
+    if os.path.exists(COOLDOWN_FILE):
+        try:
+            with open(COOLDOWN_FILE, 'r') as f:
+                last_confirm = float(f.read().strip())
+            elapsed = os.times().elapsed - last_confirm
+            if elapsed < COOLDOWN_SECONDS:
+                print(f"Cooldown active ({COOLDOWN_SECONDS - elapsed:.1f}s remaining)", file=sys.stderr)
+                return False, PID_FILE
+        except (ValueError, OSError):
+            pass
+
     if os.path.exists(PID_FILE):
         try:
             with open(PID_FILE, 'r') as f:
@@ -334,12 +378,26 @@ def check_instance():
     return True, PID_FILE
 
 
+def prewarm():
+    """Prewarm GTK3 imports so first Super+O is instant."""
+    try:
+        # Force module import and icon theme cache
+        Gtk.IconTheme.get_default()
+        print("Display switcher ready", file=sys.stderr)
+    except Exception as e:
+        print(f"Prewarm warning: {e}", file=sys.stderr)
+
+
 def cleanup(pid_file):
     if os.path.exists(pid_file):
         os.remove(pid_file)
 
 
 def main():
+    if len(sys.argv) > 1 and sys.argv[1] == "--prewarm":
+        prewarm()
+        sys.exit(0)
+
     is_new, pid_file = check_instance()
     if not is_new:
         sys.exit(0)
