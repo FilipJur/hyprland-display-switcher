@@ -1,27 +1,29 @@
 #!/bin/bash
 # display_apply.sh - MVP display mode applier with verification
-# Zero state, 8-bit default, logs to stdout/stderr
+# Zero state, 10-bit for adapter stability, logs to stdout/stderr
 
 set -uo pipefail
 
 MODE="${1:-monitor}"
 LOG_FILE="$HOME/.local/state/display-switcher.log"
 LOCK_FILE="$HOME/.local/state/display-apply.lock"
-FORCE_8BIT="${DISPLAY_SWITCHER_8BIT:-1}"  # Default 8-bit for stability
-
 # Monitor config
 MONITOR="DP-2"
 TV="DP-1"
 MONITOR_RES="3440x1440@74.98"
 TV_RES="3840x2160@120"
-TV_SCALE="1.0"
+TV_SCALE="1.5"
+BITDEPTH="10"
 
-# Bit depth
-if [[ "$FORCE_8BIT" == "1" ]]; then
-    BITDEPTH="8"
-else
-    BITDEPTH="10"
-fi
+# Color management presets
+CM_SDR="srgb"
+CM_HDR="hdr"
+
+# HDR tuning for OLED (Philips 55OLED820)
+SDR_BRIGHTNESS="1.5"
+SDR_SATURATION="1.01"
+SDR_MIN_LUMINANCE="0.005"
+SDR_MAX_LUMINANCE="200"
 
 log() {
     echo "[$(date '+%Y-%m-%d %H:%M:%S')] $*" | tee -a "$LOG_FILE"
@@ -49,22 +51,259 @@ release_lock() {
     rm -f "$LOCK_FILE"
 }
 
+# DPM performance level paths (card0 or card1 depending on GPU index)
+DPM_FILE="/sys/class/drm/card1/device/power_dpm_force_performance_level"
+CURRENT_FREQ_FILE="/sys/class/drm/card1/device/pp_dpm_mclk"
+if [[ ! -f "$DPM_FILE" ]]; then
+    DPM_FILE="/sys/class/drm/card0/device/power_dpm_force_performance_level"
+    CURRENT_FREQ_FILE="/sys/class/drm/card0/device/pp_dpm_mclk"
+fi
+
+# Force GPU to high performance level to prevent clock transitions
+# that destabilize the CH7218 adapter during mode switches.
+# Requires display-dpm.sh sudoers rule for passwordless operation.
+DPM_HELPER="$HOME/.local/bin/display-dpm.sh"
+
+force_dpm_high() {
+    if [[ -x "$DPM_HELPER" ]]; then
+        if sudo -n "$DPM_HELPER" high 2>/dev/null; then
+            log "DPM forced to high"
+        else
+            log "WARNING: DPM force failed (sudo not configured — see AGENTS.md)"
+        fi
+    fi
+}
+
+restore_dpm_auto() {
+    if [[ -x "$DPM_HELPER" ]]; then
+        sudo -n "$DPM_HELPER" auto 2>/dev/null || true
+    fi
+}
+
+log_clocks() {
+    local label="${1:-}"
+    [[ -n "$label" ]] && label=" ($label)"
+    if [[ -f "$CURRENT_FREQ_FILE" ]]; then
+        local cur
+        cur=$(grep '*' "$CURRENT_FREQ_FILE" 2>/dev/null | awk '{print $2}' | tr '\n' ' ')
+        log "GPU clock state${label}: MCLK=${cur:-unknown}"
+    fi
+    if [[ -f "$DPM_FILE" ]]; then
+        log "DPM level: $(cat "$DPM_FILE" 2>/dev/null)"
+    fi
+}
+
+# Log comprehensive DRM/HDR metadata for debugging
+log_video_metadata() {
+    local label="$1"
+    log "--- Video Metadata Dump: $label ---"
+
+    # Hyprland monitor state
+    log "[HYPRCTL monitors all]"
+    hyprctl monitors all 2>/dev/null | while IFS= read -r line; do
+        log "  $line"
+    done
+
+    # JSON monitor output (for structured data)
+    log "[HYPRCTL monitors -j]"
+    local hypr_json
+    hypr_json=$(hyprctl monitors -j 2>/dev/null)
+    if [[ -n "$hypr_json" ]]; then
+        echo "$hypr_json" | python3 -c "
+import json, sys
+try:
+    data = json.load(sys.stdin)
+    for m in data:
+        print(f\"  Monitor: {m.get('name')}\")
+        print(f\"    disabled: {m.get('disabled')}\")
+        print(f\"    currentFormat: {m.get('currentFormat')}\")
+        print(f\"    colorManagementPreset: {m.get('colorManagementPreset')}\")
+        print(f\"    sdrBrightness: {m.get('sdrBrightness')}\")
+        print(f\"    sdrSaturation: {m.get('sdrSaturation')}\")
+        print(f\"    sdrMinLuminance: {m.get('sdrMinLuminance')}\")
+        print(f\"    sdrMaxLuminance: {m.get('sdrMaxLuminance')}\")
+        print(f\"    minLuminance: {m.get('minLuminance')}\")
+        print(f\"    maxLuminance: {m.get('maxLuminance')}\")
+        print(f\"    maxAvgLuminance: {m.get('maxAvgLuminance')}\")
+        print(f\"    availableModes: {len(m.get('availableModes', []))} modes\")
+except Exception as e:
+    print(f'    Parse error: {e}')
+" 2>/dev/null | while IFS= read -r line; do
+            log "  $line"
+        done
+    fi
+
+    # DRM connector properties (most authoritative for HDR signaling)
+    log "[DRM CONNECTOR STATE]"
+    if command -v modetest >/dev/null 2>&1; then
+        modetest -p -c 2>/dev/null | grep -A5 "DP-1\|DP-2" | while IFS= read -r line; do
+            log "  $line"
+        done
+
+        # Check HDR metadata specifically
+        log "[HDR OUTPUT METADATA]"
+        modetest -p -c 2>/dev/null | grep -B1 -A10 "HDR_OUTPUT_METADATA" | while IFS= read -r line; do
+            log "  $line"
+        done
+    else
+        log "  modetest not available (install libdrm-utils)"
+    fi
+
+    # EDID info for DP-1
+    log "[EDID - DP-1]"
+    local edid_path="/sys/class/drm/card1-DP-1/edid"
+    if [[ -f "$edid_path" ]]; then
+        if command -v edid-decode >/dev/null 2>&1; then
+            edid-decode "$edid_path" 2>/dev/null | grep -E "Manufacturer|Model|HDR|Color|Gamut|Display|Max|Luminance" | while IFS= read -r line; do
+                log "  $line"
+            done
+        else
+            log "  edid-decode not available (install edid-decode)"
+            log "  EDID file exists: $edid_path ($(wc -c < "$edid_path") bytes)"
+        fi
+    else
+        log "  No EDID file found at $edid_path"
+    fi
+
+    # amdgpu driver info
+    log "[GPU DRIVER]"
+    if [[ -f /sys/class/drm/card1/device/vendor ]]; then
+        log "  Vendor: $(cat /sys/class/drm/card1/device/vendor 2>/dev/null)"
+    fi
+    if [[ -f /sys/class/drm/card1/device/device ]]; then
+        log "  Device: $(cat /sys/class/drm/card1/device/device 2>/dev/null)"
+    fi
+    if [[ -f /sys/class/drm/card1/driver/version ]]; then
+        log "  Driver version: $(cat /sys/class/drm/card1/driver/version 2>/dev/null)"
+    fi
+    log "  Kernel: $(uname -r)"
+
+    log "--- End Video Metadata Dump ---"
+}
+
 # Verify monitors match expected mode using text output (same as Python)
+is_tv_active() {
+    local check_format="${1:-false}"
+    local output
+    output=$(hyprctl monitors all 2>/dev/null)
+    
+    local in_dp1=false
+    local dp1_disabled="true"
+    local dp1_format=""
+    
+    while IFS= read -r line; do
+        line=$(echo "$line" | sed 's/^[[:space:]]*//')
+        if [[ "$line" == Monitor\ DP-1* ]]; then
+            in_dp1=true
+            dp1_disabled="false"
+        elif [[ "$line" == Monitor* ]]; then
+            # Hit a different monitor, stop processing DP-1
+            in_dp1=false
+        elif [[ "$in_dp1" == true ]] && [[ "$line" == disabled:* ]]; then
+            local val
+            val=$(echo "$line" | awk -F': ' '{print $2}')
+            if [[ "$val" == "true" ]]; then
+                dp1_disabled="true"
+            fi
+        elif [[ "$in_dp1" == true ]] && [[ "$line" == currentFormat:* ]]; then
+            dp1_format=$(echo "$line" | awk -F': ' '{print $2}')
+        fi
+    done <<< "$output"
+    
+    if [[ "$dp1_disabled" == "false" ]]; then
+        # For 10-bit modes, verify format is actually 10-bit
+        if [[ "$check_format" == "true" ]] && [[ "$BITDEPTH" == "10" ]]; then
+            if [[ "$dp1_format" != "XRGB2101010" && "$dp1_format" != "XBGR2101010" && "$dp1_format" != "ARGB2101010" ]]; then
+                log "WARNING: TV active but format is $dp1_format (expected 10-bit)"
+                return 1
+            fi
+        fi
+        return 0
+    fi
+    return 1
+}
+
+enable_tv() {
+    local mode="$1"
+    local position="$2"
+    local mirror_target="$3"
+    local cm_preset="${4:-$CM_SDR}"
+    local is_hdr=false
+    [[ "$cm_preset" == "$CM_HDR" ]] && is_hdr=true
+
+    # Disable first to force clean DSC re-handshake
+    log "Disabling ${TV} for clean reset..."
+    hyprctl keyword monitor "${TV},disable" 2>/dev/null || true
+    sleep 2
+
+    # Build the monitor config string
+    local tv_config="${TV},${TV_RES},${position},${TV_SCALE},bitdepth,${BITDEPTH},cm,${cm_preset}"
+
+    if [[ "$is_hdr" == true ]]; then
+        tv_config+=",sdrbrightness,${SDR_BRIGHTNESS}"
+        tv_config+=",sdrsaturation,${SDR_SATURATION}"
+        # NOTE: sdr_min_luminance and sdr_max_luminance are NOT supported
+        # by hyprctl keyword monitor syntax (only monitorv2 blocks).
+        # Default values apply: min=0.2 nits, max=80 nits.
+        # For OLED black levels, set these in monitors.conf via monitorv2 {}.
+    fi
+
+    if [[ -n "$mirror_target" ]]; then
+        tv_config+=",mirror,${mirror_target}"
+    fi
+
+    log "Enabling ${TV}: ${tv_config}"
+    hyprctl keyword monitor "${tv_config}"
+
+    # HDR needs more time for DSC + metadata negotiation
+    local settle_time=3
+    if [[ "$is_hdr" == true ]]; then
+        settle_time=6
+        log "HDR mode: waiting ${settle_time}s for adapter stabilization..."
+    fi
+    sleep "$settle_time"
+
+    # Verify TV is actually active (check format for 10-bit modes)
+    local check_format="false"
+    [[ "$is_hdr" == true ]] && check_format="true"
+    if is_tv_active "$check_format"; then
+        log "TV enabled successfully (format verified)"
+        return 0
+    fi
+
+    # Retry once
+    log "TV not active or wrong format, retrying..."
+    hyprctl keyword monitor "${TV},disable" 2>/dev/null || true
+    sleep 2
+    hyprctl keyword monitor "${tv_config}"
+    sleep "$settle_time"
+
+    if is_tv_active "$check_format"; then
+        log "TV enabled successfully on retry"
+        return 0
+    fi
+
+    log "ERROR: Failed to enable TV after retry"
+    log_video_metadata "TV_ENABLE_FAILED"
+    return 1
+}
+
 verify_mode() {
     local expected="$1"
     local output
     output=$(hyprctl monitors all 2>/dev/null)
-    
+
     local -A monitors
     local current_name=""
-    
+
     while IFS= read -r line; do
         line=$(echo "$line" | sed 's/^[[:space:]]*//')
-        
+
         if [[ "$line" == Monitor* ]]; then
             current_name=$(echo "$line" | awk '{print $2}')
             monitors[$current_name,"disabled"]="false"
             monitors[$current_name,"mirror"]="none"
+            monitors[$current_name,"cm"]="srgb"
         elif [[ "$line" == disabled:* ]] && [[ -n "$current_name" ]]; then
             local val
             val=$(echo "$line" | awk -F': ' '{print $2}')
@@ -73,33 +312,39 @@ verify_mode() {
             local val
             val=$(echo "$line" | awk -F': ' '{print $2}')
             monitors[$current_name,"mirror"]="$val"
+        elif [[ "$line" == colorManagementPreset:* ]] && [[ -n "$current_name" ]]; then
+            local val
+            val=$(echo "$line" | awk -F': ' '{print $2}')
+            monitors[$current_name,"cm"]="$val"
         fi
     done <<< "$output"
-    
+
     local dp2_enabled=false
     local dp1_enabled=false
     local dp1_mirror="none"
-    
+    local dp1_cm="srgb"
+
     if [[ "${monitors[DP-2,"disabled"]:-true}" == "false" ]]; then
         dp2_enabled=true
     fi
     if [[ "${monitors[DP-1,"disabled"]:-true}" == "false" ]]; then
         dp1_enabled=true
         dp1_mirror="${monitors[DP-1,"mirror"]:-none}"
+        dp1_cm="${monitors[DP-1,"cm"]:-srgb}"
     fi
-    
+
     case "$expected" in
         monitor)
             [[ "$dp2_enabled" == true && "$dp1_enabled" == false ]]
             ;;
         extend)
-            [[ "$dp2_enabled" == true && "$dp1_enabled" == true && "$dp1_mirror" != "DP-2" ]]
+            [[ "$dp2_enabled" == true && "$dp1_enabled" == true && "$dp1_mirror" != "DP-2" && "$dp1_cm" == "$CM_HDR" ]]
             ;;
         mirror)
             [[ "$dp2_enabled" == true && "$dp1_enabled" == true && "$dp1_mirror" == "DP-2" ]]
             ;;
         tv)
-            [[ "$dp2_enabled" == false && "$dp1_enabled" == true ]]
+            [[ "$dp2_enabled" == false && "$dp1_enabled" == true && "$dp1_cm" == "$CM_HDR" ]]
             ;;
         *)
             return 1
@@ -111,26 +356,41 @@ apply_mode() {
     local mode="$1"
     log "Applying mode: $mode (bitdepth: $BITDEPTH)"
     
+    log_clocks "before switch"
+    force_dpm_high
+    
     case "$mode" in
         monitor)
             # Enable target monitor FIRST, then disable old one
             # Prevents zero-monitor state which crashes Hyprland
-            hyprctl keyword monitor "${MONITOR},${MONITOR_RES},0x0,1"
+            hyprctl keyword monitor "${MONITOR},${MONITOR_RES},0x0,1,bitdepth,${BITDEPTH},cm,${CM_SDR}"
             sleep 0.3
             hyprctl keyword monitor "${TV},disable" 2>/dev/null || true
             ;;
         extend)
-            hyprctl keyword monitor "${MONITOR},${MONITOR_RES},0x0,1"
-            hyprctl keyword monitor "${TV},${TV_RES},-3840x0,${TV_SCALE},bitdepth,${BITDEPTH}"
+            hyprctl keyword monitor "${MONITOR},${MONITOR_RES},0x0,1,bitdepth,${BITDEPTH},cm,${CM_SDR}"
+            if ! enable_tv "$mode" "-3840x0" "" "$CM_HDR"; then
+                log_clocks "after extend fail"
+                log "ERROR: Failed to enable TV in extend mode"
+                exit 1
+            fi
             ;;
         mirror)
-            hyprctl keyword monitor "${MONITOR},${MONITOR_RES},0x0,1"
-            hyprctl keyword monitor "${TV},${TV_RES},auto,${TV_SCALE},bitdepth,${BITDEPTH},mirror,${MONITOR}"
+            hyprctl keyword monitor "${MONITOR},${MONITOR_RES},0x0,1,bitdepth,${BITDEPTH},cm,${CM_SDR}"
+            if ! enable_tv "$mode" "auto" "${MONITOR}"; then
+                log_clocks "after mirror fail"
+                log "ERROR: Failed to enable TV in mirror mode"
+                exit 1
+            fi
             ;;
         tv)
             # Enable target monitor FIRST, then disable old one
             # Prevents zero-monitor state which crashes Hyprland
-            hyprctl keyword monitor "${TV},${TV_RES},0x0,${TV_SCALE},bitdepth,${BITDEPTH}"
+            if ! enable_tv "$mode" "0x0" "" "$CM_HDR"; then
+                log_clocks "after tv fail"
+                log "ERROR: Failed to enable TV in tv mode"
+                exit 1
+            fi
             sleep 0.3
             hyprctl keyword monitor "${MONITOR},disable" 2>/dev/null || true
             ;;
@@ -140,8 +400,11 @@ apply_mode() {
             ;;
     esac
     
-    # Wait for compositor
+    # Wait for compositor and adapter to fully settle
     sleep 0.5
+    
+    log_clocks "after mode applied"
+    restore_dpm_auto
     
     # Verify
     if verify_mode "$mode"; then
@@ -156,7 +419,9 @@ apply_mode() {
         
         exit 0
     else
+        log_clocks "after verify fail"
         log "ERROR: Mode verification failed for $mode"
+        log_video_metadata "VERIFY_FAILED"
         exit 1
     fi
 }
