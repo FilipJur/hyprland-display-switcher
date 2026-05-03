@@ -29,8 +29,10 @@ fi
 # Create symlinks (dev mode)
 ln -sf "$SCRIPT_DIR/src/display_switcher.py" "$BIN_DIR/display-switcher.py"
 ln -sf "$SCRIPT_DIR/src/display_apply.sh" "$BIN_DIR/display-apply.sh"
+ln -sf "$SCRIPT_DIR/src/fix_pcon_audio.py" "$BIN_DIR/fix-pcon-audio.py"
 chmod +x "$SCRIPT_DIR/src/display_switcher.py"
 chmod +x "$SCRIPT_DIR/src/display_apply.sh"
+chmod +x "$SCRIPT_DIR/src/fix_pcon_audio.py"
 
 # Install CSS config if not exists
 if [[ ! -f "$CONFIG_DIR/display-switcher.css" ]]; then
@@ -44,6 +46,7 @@ echo ""
 echo "Installed (symlinks):"
 echo "  $BIN_DIR/display-switcher.py -> src/display_switcher.py"
 echo "  $BIN_DIR/display-apply.sh -> src/display_apply.sh"
+echo "  $BIN_DIR/fix-pcon-audio.py -> src/fix_pcon_audio.py"
 echo ""
 
 # Check keybinding
