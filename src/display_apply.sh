@@ -1,6 +1,20 @@
 #!/bin/bash
 # display_apply.sh - MVP display mode applier with verification
 # Zero state, 10-bit for adapter stability, logs to stdout/stderr
+#
+# TV OVERSCAN FIX:
+# If you see edges cut off in TV mode, your Philips TV is likely overscanning.
+# The EDID reports "IT scan behavior: Always Underscanned" which means PC
+# content gets scaled down. To fix:
+#   Settings → Picture → Screen Format → "Unscaled" / "Just Scan" / "Screen Fit"
+# Or on Philips 55OLED820:
+#   Settings → Channels & inputs → External Inputs → HDMI → PC Mode (enable)
+#
+# Apps not respecting 1.5x scaling?
+#   - XWayland apps: add 'xwayland { force_zero_scaling = true }' to hyprland.conf
+#   - Native Wayland apps should scale automatically via wl_output protocol
+#   - GTK: unset GDK_SCALE (don't set it globally)
+#   - Qt: QT_AUTO_SCREEN_SCALE_FACTOR=1
 
 set -uo pipefail
 
@@ -16,18 +30,20 @@ TV_RES="3840x2160@120"
 TV_SCALE="1.5"
 BITDEPTH="10"
 
-# Color management presets
-CM_SDR="srgb"
-CM_SDR_VIBRANT="dcip3"    # Wider gamut for more punchy SDR colors
-CM_HDR="hdredid"     # Use TV's actual measured primaries from EDID (more accurate for WOLED)
-CM_HDR_EDID="hdredid"     # Use TV's actual primaries from EDID
+# IMPORTANT: Color management (bitdepth, cm, sdrbrightness, sdr_min_luminance)
+# is now handled by monitorv2 {} blocks in ~/.config/hypr/hyprland.conf.
+# This script only handles monitor enable/disable/layout.
+# See the monitorv2 example in the README or project docs.
+#
+# Reference values for monitorv2 config:
+#   DP-1 (TV):  cm=hdr, bitdepth=10, sdr_min_luminance=0.005
+#   DP-2 (Main): cm=dcip3, bitdepth=10
 
-# HDR tuning for OLED (Philips 55OLED820)
-# sdrbrightness: 1.0-2.0, boosts SDR content brightness in HDR mode
-# sdrsaturation: 0.5-1.5, boosts SDR content saturation in HDR mode
-# Note: hdredid tends to dim SDR desktop vs generic hdr, so brightness is maxed
-SDR_BRIGHTNESS="2.0"
-SDR_SATURATION="1.1"
+# Color management presets (used by verify_mode() only)
+CM_SDR="srgb"
+CM_HDR="hdr"
+
+# Legacy tuning values (for reference, configure in monitorv2 {})
 SDR_MIN_LUMINANCE="0.005"
 SDR_MAX_LUMINANCE="400"
 
@@ -38,6 +54,34 @@ AUDIO_TV="alsa_output.pci-0000_09_00.1.hdmi-stereo"
 
 log() {
     echo "[$(date '+%Y-%m-%d %H:%M:%S')] $*" | tee -a "$LOG_FILE"
+}
+
+# Check TV EDID for scan behavior that causes overscan/underscan
+# Logs a warning if the TV is configured to scan PC content incorrectly
+check_tv_scan_behavior() {
+    local edid_path="/sys/class/drm/card1-DP-1/edid"
+    if [[ ! -f "$edid_path" ]]; then
+        edid_path="/sys/class/drm/card0-DP-1/edid"
+    fi
+    
+    if [[ ! -f "$edid_path" ]] || ! command -v edid-decode >/dev/null 2>&1; then
+        return
+    fi
+    
+    local scan_info
+    scan_info=$(edid-decode "$edid_path" 2>/dev/null | grep -E "scan behavior|Overscan|Underscan")
+    if [[ -n "$scan_info" ]]; then
+        log "TV EDID scan behavior:"
+        while IFS= read -r line; do
+            log "  $line"
+        done <<< "$scan_info"
+        
+        # Warn about common overscan issues
+        if echo "$scan_info" | grep -qi "overscan"; then
+            log "WARNING: TV reports overscan behavior. If edges are cut off,"
+            log "  set TV to: Picture → Screen Format → Unscaled/Just Scan"
+        fi
+    fi
 }
 
 # Simple lock file (PID-based) to prevent concurrent execution
@@ -189,19 +233,18 @@ fix_pcon_hdmi_mode() {
 
 # Trigger DP encoder reconfiguration by toggling a display parameter.
 # This forces amdgpu to re-read PCON DPCD state and reconfigure audio SDP generation.
+# NOTE: Color/bitdepth settings are handled by monitorv2 {} in hyprland.conf.
 reconfigure_dp_encoder() {
     local display="$1"
     local res="$2"
     local pos="$3"
     local scale="$4"
-    local bitdepth="$5"
-    local cm="$6"
     
     log "Reconfiguring DP encoder for audio SDP generation..."
-    # Toggle bitdepth temporarily to force a mode set
-    hyprctl keyword monitor "${display},${res},${pos},${scale},bitdepth,8,cm,${CM_SDR}" 2>/dev/null || true
+    # Toggle resolution temporarily to force a mode set
+    hyprctl keyword monitor "${display},disable" 2>/dev/null || true
     sleep 1
-    hyprctl keyword monitor "${display},${res},${pos},${scale},bitdepth,${bitdepth},cm,${cm},sdrbrightness,${SDR_BRIGHTNESS},sdrsaturation,${SDR_SATURATION}" 2>/dev/null || true
+    hyprctl keyword monitor "${display},${res},${pos},${scale}" 2>/dev/null || true
     sleep 2
     log "DP encoder reconfigured"
 }
@@ -337,12 +380,8 @@ is_tv_active() {
 }
 
 enable_tv() {
-    local mode="$1"
-    local position="$2"
-    local mirror_target="$3"
-    local cm_preset="${4:-$CM_SDR}"
-    local is_hdr=false
-    [[ "$cm_preset" == "$CM_HDR" ]] && is_hdr=true
+    local position="$1"
+    local mirror_target="$2"
 
     # Disable first to force clean DSC re-handshake
     log "Disabling ${TV} for clean reset..."
@@ -350,16 +389,9 @@ enable_tv() {
     sleep 2
 
     # Build the monitor config string
-    local tv_config="${TV},${TV_RES},${position},${TV_SCALE},bitdepth,${BITDEPTH},cm,${cm_preset}"
-
-    if [[ "$is_hdr" == true ]]; then
-        tv_config+=",sdrbrightness,${SDR_BRIGHTNESS}"
-        tv_config+=",sdrsaturation,${SDR_SATURATION}"
-        # NOTE: sdr_min_luminance and sdr_max_luminance are NOT supported
-        # by hyprctl keyword monitor syntax (only monitorv2 blocks).
-        # Default values apply: min=0.2 nits, max=80 nits.
-        # For OLED black levels, set these in monitors.conf via monitorv2 {}.
-    fi
+    # NOTE: Color management (cm, bitdepth, HDR) is handled by monitorv2 {} 
+    # in hyprland.conf. Only pass layout params here.
+    local tv_config="${TV},${TV_RES},${position},${TV_SCALE}"
 
     if [[ -n "$mirror_target" ]]; then
         tv_config+=",mirror,${mirror_target}"
@@ -368,18 +400,13 @@ enable_tv() {
     log "Enabling ${TV}: ${tv_config}"
     hyprctl keyword monitor "${tv_config}"
 
-    # HDR needs more time for DSC + metadata negotiation
-    local settle_time=3
-    if [[ "$is_hdr" == true ]]; then
-        settle_time=6
-        log "HDR mode: waiting ${settle_time}s for adapter stabilization..."
-    fi
+    # Wait for adapter to settle (DSC + FRL link training)
+    local settle_time=6
+    log "Waiting ${settle_time}s for adapter stabilization..."
     sleep "$settle_time"
 
     # Verify TV is actually active (check format for 10-bit modes)
-    local check_format="false"
-    [[ "$is_hdr" == true ]] && check_format="true"
-    if is_tv_active "$check_format"; then
+    if is_tv_active "true"; then
         log "TV enabled successfully (format verified)"
         return 0
     fi
@@ -391,7 +418,7 @@ enable_tv() {
     hyprctl keyword monitor "${tv_config}"
     sleep "$settle_time"
 
-    if is_tv_active "$check_format"; then
+    if is_tv_active "true"; then
         log "TV enabled successfully on retry"
         return 0
     fi
@@ -467,7 +494,7 @@ verify_mode() {
 
 apply_mode() {
     local mode="$1"
-    log "Applying mode: $mode (bitdepth: $BITDEPTH)"
+    log "Applying mode: $mode (color managed by monitorv2)"
     
     log_clocks "before switch"
     force_dpm_high
@@ -476,17 +503,17 @@ apply_mode() {
         monitor)
             # Enable target monitor FIRST, then disable old one
             # Prevents zero-monitor state which crashes Hyprland
-            # Using vibrant SDR preset (DCI-P3) for more saturated colors
-            hyprctl keyword monitor "${MONITOR},${MONITOR_RES},0x0,1,bitdepth,${BITDEPTH},cm,${CM_SDR_VIBRANT}"
+            # NOTE: Color management is handled by monitorv2 {} in hyprland.conf
+            hyprctl keyword monitor "${MONITOR},${MONITOR_RES},0x0,1"
             sleep 0.3
             hyprctl keyword monitor "${TV},disable" 2>/dev/null || true
             set_audio "$AUDIO_TA10R" "TA-10R (headphones)"
             ;;
         extend)
-            # Main monitor uses vibrant SDR preset for more punchy colors
-            hyprctl keyword monitor "${MONITOR},${MONITOR_RES},0x0,1,bitdepth,${BITDEPTH},cm,${CM_SDR_VIBRANT}"
+            # NOTE: Color management is handled by monitorv2 {} in hyprland.conf
+            hyprctl keyword monitor "${MONITOR},${MONITOR_RES},0x0,1"
             # Position: -2560x0 = TV logical width (3840/1.5) to the left, no gap
-            if ! enable_tv "$mode" "-2560x0" "" "$CM_HDR"; then
+            if ! enable_tv "-2560x0" ""; then
                 log_clocks "after extend fail"
                 log "ERROR: Failed to enable TV in extend mode"
                 exit 1
@@ -494,9 +521,9 @@ apply_mode() {
             set_audio "$AUDIO_FIIO" "FiiO E10 (desktop)"
             ;;
         mirror)
-            # Main monitor uses vibrant SDR preset
-            hyprctl keyword monitor "${MONITOR},${MONITOR_RES},0x0,1,bitdepth,${BITDEPTH},cm,${CM_SDR_VIBRANT}"
-            if ! enable_tv "$mode" "auto" "${MONITOR}"; then
+            # NOTE: Color management is handled by monitorv2 {} in hyprland.conf
+            hyprctl keyword monitor "${MONITOR},${MONITOR_RES},0x0,1"
+            if ! enable_tv "auto" "${MONITOR}"; then
                 log_clocks "after mirror fail"
                 log "ERROR: Failed to enable TV in mirror mode"
                 exit 1
@@ -506,7 +533,8 @@ apply_mode() {
         tv)
             # Enable target monitor FIRST, then disable old one
             # Prevents zero-monitor state which crashes Hyprland
-            if ! enable_tv "$mode" "0x0" "" "$CM_HDR"; then
+            check_tv_scan_behavior
+            if ! enable_tv "0x0" ""; then
                 log_clocks "after tv fail"
                 log "ERROR: Failed to enable TV in tv mode"
                 exit 1
@@ -521,7 +549,7 @@ apply_mode() {
             
             # Force DP encoder reconfiguration so amdgpu re-reads the corrected
             # PCON state and enables audio SDP generation for HDMI mode.
-            reconfigure_dp_encoder "$TV" "$TV_RES" "0x0" "$TV_SCALE" "$BITDEPTH" "$CM_HDR"
+            reconfigure_dp_encoder "$TV" "$TV_RES" "0x0" "$TV_SCALE"
             
             set_audio "$AUDIO_TV" "TV HDMI (Philips)" 10
             restart_audio_sink "$AUDIO_TV"
