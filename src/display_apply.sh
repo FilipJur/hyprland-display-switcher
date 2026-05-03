@@ -18,13 +18,18 @@ BITDEPTH="10"
 
 # Color management presets
 CM_SDR="srgb"
-CM_HDR="hdr"
+CM_SDR_VIBRANT="dcip3"    # Wider gamut for more punchy SDR colors
+CM_HDR="hdredid"     # Use TV's actual measured primaries from EDID (more accurate for WOLED)
+CM_HDR_EDID="hdredid"     # Use TV's actual primaries from EDID
 
 # HDR tuning for OLED (Philips 55OLED820)
-SDR_BRIGHTNESS="1.5"
-SDR_SATURATION="1.01"
+# sdrbrightness: 1.0-2.0, boosts SDR content brightness in HDR mode
+# sdrsaturation: 0.5-1.5, boosts SDR content saturation in HDR mode
+# Note: hdredid tends to dim SDR desktop vs generic hdr, so brightness is maxed
+SDR_BRIGHTNESS="2.0"
+SDR_SATURATION="1.1"
 SDR_MIN_LUMINANCE="0.005"
-SDR_MAX_LUMINANCE="200"
+SDR_MAX_LUMINANCE="400"
 
 # Audio sink names (PipeWire/ALSA)
 AUDIO_TA10R="alsa_output.usb-xDuoo_USB_Audio_2.0_TA-10R-00.analog-stereo"
@@ -194,7 +199,7 @@ reconfigure_dp_encoder() {
     
     log "Reconfiguring DP encoder for audio SDP generation..."
     # Toggle bitdepth temporarily to force a mode set
-    hyprctl keyword monitor "${display},${res},${pos},${scale},bitdepth,8,cm,sdr" 2>/dev/null || true
+    hyprctl keyword monitor "${display},${res},${pos},${scale},bitdepth,8,cm,${CM_SDR}" 2>/dev/null || true
     sleep 1
     hyprctl keyword monitor "${display},${res},${pos},${scale},bitdepth,${bitdepth},cm,${cm},sdrbrightness,${SDR_BRIGHTNESS},sdrsaturation,${SDR_SATURATION}" 2>/dev/null || true
     sleep 2
@@ -471,13 +476,15 @@ apply_mode() {
         monitor)
             # Enable target monitor FIRST, then disable old one
             # Prevents zero-monitor state which crashes Hyprland
-            hyprctl keyword monitor "${MONITOR},${MONITOR_RES},0x0,1,bitdepth,${BITDEPTH},cm,${CM_SDR}"
+            # Using vibrant SDR preset (DCI-P3) for more saturated colors
+            hyprctl keyword monitor "${MONITOR},${MONITOR_RES},0x0,1,bitdepth,${BITDEPTH},cm,${CM_SDR_VIBRANT}"
             sleep 0.3
             hyprctl keyword monitor "${TV},disable" 2>/dev/null || true
             set_audio "$AUDIO_TA10R" "TA-10R (headphones)"
             ;;
         extend)
-            hyprctl keyword monitor "${MONITOR},${MONITOR_RES},0x0,1,bitdepth,${BITDEPTH},cm,${CM_SDR}"
+            # Main monitor uses vibrant SDR preset for more punchy colors
+            hyprctl keyword monitor "${MONITOR},${MONITOR_RES},0x0,1,bitdepth,${BITDEPTH},cm,${CM_SDR_VIBRANT}"
             # Position: -2560x0 = TV logical width (3840/1.5) to the left, no gap
             if ! enable_tv "$mode" "-2560x0" "" "$CM_HDR"; then
                 log_clocks "after extend fail"
@@ -487,7 +494,8 @@ apply_mode() {
             set_audio "$AUDIO_FIIO" "FiiO E10 (desktop)"
             ;;
         mirror)
-            hyprctl keyword monitor "${MONITOR},${MONITOR_RES},0x0,1,bitdepth,${BITDEPTH},cm,${CM_SDR}"
+            # Main monitor uses vibrant SDR preset
+            hyprctl keyword monitor "${MONITOR},${MONITOR_RES},0x0,1,bitdepth,${BITDEPTH},cm,${CM_SDR_VIBRANT}"
             if ! enable_tv "$mode" "auto" "${MONITOR}"; then
                 log_clocks "after mirror fail"
                 log "ERROR: Failed to enable TV in mirror mode"
