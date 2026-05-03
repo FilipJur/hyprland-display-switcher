@@ -310,6 +310,8 @@ monitorv2 {
     scale = ${TV_SCALE}
     bitdepth = 10
     cm = hdr
+    sdrbrightness = 1.7
+    sdrsaturation = 1.05
     sdr_min_luminance = 0.005
     sdr_max_luminance = 400
     min_luminance = 0
@@ -347,6 +349,8 @@ monitorv2 {
     scale = ${TV_SCALE}
     bitdepth = 10
     cm = hdr
+    sdrbrightness = 1.7
+    sdrsaturation = 1.05
     sdr_min_luminance = 0.005
     sdr_max_luminance = 400
     min_luminance = 0
@@ -385,6 +389,8 @@ monitorv2 {
     scale = ${TV_SCALE}
     bitdepth = 10
     cm = hdr
+    sdrbrightness = 1.7
+    sdrsaturation = 1.05
     sdr_min_luminance = 0.005
     sdr_max_luminance = 400
     min_luminance = 0
