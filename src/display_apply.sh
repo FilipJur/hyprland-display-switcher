@@ -312,11 +312,6 @@ monitorv2 {
     cm = hdredid
     sdrbrightness = 1.4
     sdrsaturation = 1.0
-    sdr_min_luminance = 0.005
-    sdr_max_luminance = 200
-    min_luminance = 0
-    max_luminance = 800
-    max_avg_luminance = 200
     supports_hdr = 1
     supports_wide_color = 1
 }
@@ -351,11 +346,6 @@ monitorv2 {
     cm = hdredid
     sdrbrightness = 1.4
     sdrsaturation = 1.0
-    sdr_min_luminance = 0.005
-    sdr_max_luminance = 200
-    min_luminance = 0
-    max_luminance = 800
-    max_avg_luminance = 200
     supports_hdr = 1
     supports_wide_color = 1
 }
@@ -391,11 +381,6 @@ monitorv2 {
     cm = hdredid
     sdrbrightness = 1.4
     sdrsaturation = 1.0
-    sdr_min_luminance = 0.005
-    sdr_max_luminance = 200
-    min_luminance = 0
-    max_luminance = 800
-    max_avg_luminance = 200
     supports_hdr = 1
     supports_wide_color = 1
 }
