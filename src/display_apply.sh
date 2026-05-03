@@ -242,9 +242,11 @@ reconfigure_dp_encoder() {
     
     log "Reconfiguring DP encoder for audio SDP generation..."
     # Toggle resolution temporarily to force a mode set
+    # bitdepth and cm required here too — hyprctl keyword monitor overrides
+    # monitorv2 settings and defaults to 8-bit without them.
     hyprctl keyword monitor "${display},disable" 2>/dev/null || true
     sleep 1
-    hyprctl keyword monitor "${display},${res},${pos},${scale}" 2>/dev/null || true
+    hyprctl keyword monitor "${display},${res},${pos},${scale},bitdepth,10,cm,hdr" 2>/dev/null || true
     sleep 2
     log "DP encoder reconfigured"
 }
@@ -389,9 +391,12 @@ enable_tv() {
     sleep 2
 
     # Build the monitor config string
-    # NOTE: Color management (cm, bitdepth, HDR) is handled by monitorv2 {} 
-    # in hyprland.conf. Only pass layout params here.
-    local tv_config="${TV},${TV_RES},${position},${TV_SCALE}"
+    # NOTE: bitdepth and cm are required here because hyprctl keyword monitor
+    # overrides monitorv2 {} settings and reverts to defaults for unspecified params.
+    # Without bitdepth,10 the adapter falls back to 8-bit (XRGB8888), failing verification.
+    # sdrbrightness and sdrsaturation removed to avoid Hyprland SIGABRT (issue #9716).
+    # sdr_min_luminance, sdr_max_luminance handled by monitorv2 {} only (not supported inline).
+    local tv_config="${TV},${TV_RES},${position},${TV_SCALE},bitdepth,10,cm,hdr"
 
     if [[ -n "$mirror_target" ]]; then
         tv_config+=",mirror,${mirror_target}"
