@@ -5,6 +5,7 @@ Zero state, detects actual monitor layout, always shows 4 modes.
 
 import os
 import sys
+import time
 import subprocess
 import signal
 from typing import List, Dict, Any
@@ -329,7 +330,7 @@ class DisplaySwitcher(Gtk.Window):
         try:
             # Write cooldown timestamp to prevent rapid re-invocation
             with open(COOLDOWN_FILE, 'w') as f:
-                f.write(str(os.times().elapsed))
+                f.write(str(time.time()))
             script = os.path.expanduser("~/.local/bin/display-apply.sh")
             subprocess.Popen([script, selected], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         except Exception as e:
@@ -356,7 +357,7 @@ def check_instance():
         try:
             with open(COOLDOWN_FILE, 'r') as f:
                 last_confirm = float(f.read().strip())
-            elapsed = os.times().elapsed - last_confirm
+            elapsed = time.time() - last_confirm
             if elapsed < COOLDOWN_SECONDS:
                 print(f"Cooldown active ({COOLDOWN_SECONDS - elapsed:.1f}s remaining)", file=sys.stderr)
                 return False, PID_FILE
@@ -381,8 +382,10 @@ def check_instance():
 def prewarm():
     """Prewarm GTK3 imports so first Super+O is instant."""
     try:
-        # Force module import and icon theme cache
-        Gtk.IconTheme.get_default()
+        # Only warm icon theme if a display is available
+        screen = Gdk.Screen.get_default()
+        if screen:
+            Gtk.IconTheme.get_for_screen(screen)
         print("Display switcher ready", file=sys.stderr)
     except Exception as e:
         print(f"Prewarm warning: {e}", file=sys.stderr)

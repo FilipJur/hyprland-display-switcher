@@ -4,6 +4,7 @@
 
 set -uo pipefail
 
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 MODE="${1:-monitor}"
 LOG_FILE="$HOME/.local/state/display-switcher.log"
 LOCK_FILE="$HOME/.local/state/display-apply.lock"
@@ -24,6 +25,11 @@ SDR_BRIGHTNESS="1.5"
 SDR_SATURATION="1.01"
 SDR_MIN_LUMINANCE="0.005"
 SDR_MAX_LUMINANCE="200"
+
+# Audio sink names (PipeWire/ALSA)
+AUDIO_TA10R="alsa_output.usb-xDuoo_USB_Audio_2.0_TA-10R-00.analog-stereo"
+AUDIO_FIIO="alsa_output.usb-FiiO_DigiHug_USB_Audio-01.analog-stereo"
+AUDIO_TV="alsa_output.pci-0000_09_00.1.hdmi-stereo"
 
 log() {
     echo "[$(date '+%Y-%m-%d %H:%M:%S')] $*" | tee -a "$LOG_FILE"
@@ -91,6 +97,108 @@ log_clocks() {
     if [[ -f "$DPM_FILE" ]]; then
         log "DPM level: $(cat "$DPM_FILE" 2>/dev/null)"
     fi
+}
+
+set_audio() {
+    local sink_name="$1"
+    local label="$2"
+    local retry="${3:-0}"
+    
+    if ! command -v pactl >/dev/null 2>&1; then
+        log "WARNING: pactl not available, skipping audio switch"
+        return 1
+    fi
+    
+    local waited=0
+    while true; do
+        if pactl list sinks short | grep -q "${sink_name}"; then
+            pactl set-default-sink "${sink_name}" 2>/dev/null
+            pactl suspend-sink "${sink_name}" 0 2>/dev/null
+            log "Audio: ${label}"
+            return 0
+        fi
+        if [[ "$waited" -ge "$retry" ]]; then
+            log "WARNING: Audio sink not found: ${sink_name}"
+            return 1
+        fi
+        log "Audio: waiting for sink ${sink_name}... ($waited/${retry}s)"
+        sleep 1
+        ((waited++))
+    done
+}
+
+# Restart audio PCM device to force fresh audio SDPs after PCON FRL link stabilizes
+restart_audio_sink() {
+    local sink_name="$1"
+    
+    if ! command -v pactl >/dev/null 2>&1; then
+        return
+    fi
+    
+    if pactl list sinks short | grep -q "${sink_name}"; then
+        log "Restarting audio stream for fresh PCON SDPs..."
+        pactl suspend-sink "${sink_name}" 1 2>/dev/null
+        sleep 2
+        pactl suspend-sink "${sink_name}" 0 2>/dev/null
+        log "Audio stream restarted"
+    fi
+}
+
+# Fix CH7218 PCON DPCD registers for HDMI audio forwarding.
+# The amdgpu driver never sets 0x3050 (HDMI mode) and drops Source CTL on 0x305A.
+# This script sets both and polls for FRL link readiness.
+# Requires root access to /dev/drm_dp_aux0.
+fix_pcon_hdmi_mode() {
+    local script_path="${SCRIPT_DIR}/fix-pcon-audio.py"
+    
+    if [[ ! -f "$script_path" ]]; then
+        log "WARNING: fix-pcon-audio.py not found -- skipping PCON HDMI fix"
+        return 1
+    fi
+    
+    if [[ ! -e /dev/drm_dp_aux0 ]]; then
+        log "WARNING: DPCD AUX device not found -- skipping PCON HDMI fix"
+        return 1
+    fi
+    
+    log "Fixing PCON HDMI mode for audio forwarding..."
+    
+    local output
+    if [[ "$(id -u)" -eq 0 ]]; then
+        output=$(python3 "$script_path" 2>&1)
+    elif command -v sudo >/dev/null 2>&1 && sudo -n true 2>/dev/null; then
+        output=$(sudo python3 "$script_path" 2>&1)
+    else
+        log "WARNING: Cannot fix PCON HDMI mode -- root required for DPCD access"
+        log "Add to /etc/sudoers: filip ALL=(ALL) NOPASSWD: $script_path"
+        return 1
+    fi
+    
+    # Log script output
+    while IFS= read -r line; do
+        log "PCON: $line"
+    done <<< "$output"
+    
+    return 0
+}
+
+# Trigger DP encoder reconfiguration by toggling a display parameter.
+# This forces amdgpu to re-read PCON DPCD state and reconfigure audio SDP generation.
+reconfigure_dp_encoder() {
+    local display="$1"
+    local res="$2"
+    local pos="$3"
+    local scale="$4"
+    local bitdepth="$5"
+    local cm="$6"
+    
+    log "Reconfiguring DP encoder for audio SDP generation..."
+    # Toggle bitdepth temporarily to force a mode set
+    hyprctl keyword monitor "${display},${res},${pos},${scale},bitdepth,8,cm,sdr" 2>/dev/null || true
+    sleep 1
+    hyprctl keyword monitor "${display},${res},${pos},${scale},bitdepth,${bitdepth},cm,${cm},sdrbrightness,${SDR_BRIGHTNESS},sdrsaturation,${SDR_SATURATION}" 2>/dev/null || true
+    sleep 2
+    log "DP encoder reconfigured"
 }
 
 # Log comprehensive DRM/HDR metadata for debugging
@@ -366,14 +474,17 @@ apply_mode() {
             hyprctl keyword monitor "${MONITOR},${MONITOR_RES},0x0,1,bitdepth,${BITDEPTH},cm,${CM_SDR}"
             sleep 0.3
             hyprctl keyword monitor "${TV},disable" 2>/dev/null || true
+            set_audio "$AUDIO_TA10R" "TA-10R (headphones)"
             ;;
         extend)
             hyprctl keyword monitor "${MONITOR},${MONITOR_RES},0x0,1,bitdepth,${BITDEPTH},cm,${CM_SDR}"
-            if ! enable_tv "$mode" "-3840x0" "" "$CM_HDR"; then
+            # Position: -2560x0 = TV logical width (3840/1.5) to the left, no gap
+            if ! enable_tv "$mode" "-2560x0" "" "$CM_HDR"; then
                 log_clocks "after extend fail"
                 log "ERROR: Failed to enable TV in extend mode"
                 exit 1
             fi
+            set_audio "$AUDIO_FIIO" "FiiO E10 (desktop)"
             ;;
         mirror)
             hyprctl keyword monitor "${MONITOR},${MONITOR_RES},0x0,1,bitdepth,${BITDEPTH},cm,${CM_SDR}"
@@ -382,6 +493,7 @@ apply_mode() {
                 log "ERROR: Failed to enable TV in mirror mode"
                 exit 1
             fi
+            set_audio "$AUDIO_FIIO" "FiiO E10 (desktop)"
             ;;
         tv)
             # Enable target monitor FIRST, then disable old one
@@ -393,6 +505,18 @@ apply_mode() {
             fi
             sleep 0.3
             hyprctl keyword monitor "${MONITOR},disable" 2>/dev/null || true
+            
+            # Fix PCON HDMI mode so the CH7218 forwards audio.
+            # The amdgpu driver leaves 0x3050=0x00 (DVI, no audio) and drops
+            # Source CTL on 0x305A, preventing FRL link training completion.
+            fix_pcon_hdmi_mode
+            
+            # Force DP encoder reconfiguration so amdgpu re-reads the corrected
+            # PCON state and enables audio SDP generation for HDMI mode.
+            reconfigure_dp_encoder "$TV" "$TV_RES" "0x0" "$TV_SCALE" "$BITDEPTH" "$CM_HDR"
+            
+            set_audio "$AUDIO_TV" "TV HDMI (Philips)" 10
+            restart_audio_sink "$AUDIO_TV"
             ;;
         *)
             log "ERROR: Unknown mode: $mode"

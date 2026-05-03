@@ -163,6 +163,16 @@ HDR tuning: `sdrbrightness=1.5`, `sdrsaturation=1.01`
 - Requires sudoers rule: `filip ALL=(ALL) NOPASSWD: /home/filip/.local/bin/display-dpm.sh`
 - Without it, GPU clock transitions during mode switch are handled by kernel boot params
 
+### TV audio not working (CH7218 PCON)
+- Root cause: amdgpu driver never sets DPCD 0x3050 to HDMI mode (stays DVI, no audio) and drops Source CTL on 0x305A
+- The script now includes a userspace fix that writes the correct PCON registers after display enable
+- Requires sudoers rule for DPCD access:
+  ```
+  filip ALL=(ALL) NOPASSWD: /home/filip/.local/bin/fix-pcon-audio.py
+  ```
+- To apply: `su -` then `visudo`, add the line above, save and exit
+- If sudo is not configured, the script logs a warning and skips the fix
+
 ## Installation
 
 ```bash
@@ -181,6 +191,7 @@ bindd = $mainMod, O, Toggle display mode, exec, python3 ~/.local/bin/display-swi
 ~/.local/bin/display-switcher.py    # Symlink → src/display_switcher.py
 ~/.local/bin/display-apply.sh       # Symlink → src/display_apply.sh
 ~/.local/bin/display-dpm.sh         # Symlink → src/display-dpm.sh
+~/.local/bin/fix-pcon-audio.py      # Symlink → src/fix_pcon_audio.py
 ~/.config/hypr/display-switcher.css # Theme styling
 ~/.local/state/display-switcher.log # Application logs
 ~/.local/state/display-apply.lock   # Concurrent execution lock
