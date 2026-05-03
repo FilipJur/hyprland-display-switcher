@@ -41,7 +41,7 @@ BITDEPTH="10"
 
 # Color management presets (used by verify_mode() only)
 CM_SDR="srgb"
-CM_HDR="hdr"
+CM_HDR="hdredid"
 
 # Legacy tuning values (for reference, configure in monitorv2 {})
 SDR_MIN_LUMINANCE="0.005"
@@ -309,7 +309,7 @@ monitorv2 {
     position = -2560x0
     scale = ${TV_SCALE}
     bitdepth = 10
-    cm = hdr
+    cm = hdredid
     sdrbrightness = 1.4
     sdrsaturation = 1.0
     sdr_min_luminance = 0.005
@@ -348,7 +348,7 @@ monitorv2 {
     position = 0x0
     scale = ${TV_SCALE}
     bitdepth = 10
-    cm = hdr
+    cm = hdredid
     sdrbrightness = 1.4
     sdrsaturation = 1.0
     sdr_min_luminance = 0.005
@@ -388,7 +388,7 @@ monitorv2 {
     position = 0x0
     scale = ${TV_SCALE}
     bitdepth = 10
-    cm = hdr
+    cm = hdredid
     sdrbrightness = 1.4
     sdrsaturation = 1.0
     sdr_min_luminance = 0.005
