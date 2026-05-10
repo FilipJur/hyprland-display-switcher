@@ -4,24 +4,26 @@ Zero state, detects actual monitor layout, always shows 4 modes.
 """
 
 import os
+import signal
+import subprocess
 import sys
 import time
-import subprocess
-import signal
-from typing import List, Dict, Any
+from typing import Any, Dict, List
+
 import gi
 
-gi.require_version('Gtk', '3.0')
-gi.require_version('Gdk', '3.0')
+gi.require_version("Gtk", "3.0")
+gi.require_version("Gdk", "3.0")
 
 try:
-    gi.require_version('GtkLayerShell', '0.1')
+    gi.require_version("GtkLayerShell", "0.1")
     from gi.repository import GtkLayerShell
+
     HAS_LAYER_SHELL = True
 except (ValueError, ImportError):
     HAS_LAYER_SHELL = False
 
-from gi.repository import Gtk, Gdk, GLib
+from gi.repository import Gdk, GLib, Gtk
 
 CSS_FILE = os.path.expanduser("~/.config/hypr/display-switcher.css")
 PID_FILE = os.path.expanduser("~/.local/state/display-switcher.pid")
@@ -30,10 +32,20 @@ COOLDOWN_SECONDS = 8
 TIMEOUT_SECONDS = 3
 
 MODES: List[Dict[str, Any]] = [
-    {"id": "monitor",  "name": "Monitor",  "icon": "video-display-symbolic",        "desc": "SDR"},
-    {"id": "extend",   "name": "Extend",   "icon": "video-joined-displays-symbolic", "desc": "HDR"},
-    {"id": "mirror",   "name": "Mirror",   "icon": "view-mirror-symbolic",           "desc": "SDR"},
-    {"id": "tv",       "name": "TV",       "icon": "tv-symbolic",                    "desc": "HDR"},
+    {
+        "id": "monitor",
+        "name": "Monitor",
+        "icon": "video-display-symbolic",
+        "desc": "SDR",
+    },
+    {
+        "id": "extend",
+        "name": "Extend",
+        "icon": "video-joined-displays-symbolic",
+        "desc": "HDR",
+    },
+    {"id": "mirror", "name": "Mirror", "icon": "view-mirror-symbolic", "desc": "SDR"},
+    {"id": "tv", "name": "TV", "icon": "tv-symbolic", "desc": "HDR"},
 ]
 
 ICON_FALLBACKS = {
@@ -48,28 +60,30 @@ def detect_current_mode() -> str:
     """Detect current mode from actual monitor layout."""
     try:
         output = subprocess.check_output(
-            ["hyprctl", "monitors", "all"],
-            text=True,
-            timeout=5
+            ["hyprctl", "monitors", "all"], text=True, timeout=5
         )
     except (subprocess.TimeoutExpired, FileNotFoundError):
         return "monitor"  # fallback
 
     monitors = {}
     current_monitor = None
-    for line in output.split('\n'):
+    for line in output.split("\n"):
         line = line.strip()
-        if line.startswith('Monitor '):
+        if line.startswith("Monitor "):
             parts = line.split()
             if len(parts) >= 2:
                 current_monitor = parts[1]
-                monitors[current_monitor] = {"disabled": False, "mirror": None, "cm": "srgb"}
-        elif line.startswith('disabled: ') and current_monitor:
-            monitors[current_monitor]["disabled"] = (line.split(': ')[1] == "true")
-        elif line.startswith('mirrorOf: ') and current_monitor:
-            monitors[current_monitor]["mirror"] = line.split(': ')[1]
-        elif line.startswith('colorManagementPreset: ') and current_monitor:
-            monitors[current_monitor]["cm"] = line.split(': ')[1]
+                monitors[current_monitor] = {
+                    "disabled": False,
+                    "mirror": None,
+                    "cm": "srgb",
+                }
+        elif line.startswith("disabled: ") and current_monitor:
+            monitors[current_monitor]["disabled"] = line.split(": ")[1] == "true"
+        elif line.startswith("mirrorOf: ") and current_monitor:
+            monitors[current_monitor]["mirror"] = line.split(": ")[1]
+        elif line.startswith("colorManagementPreset: ") and current_monitor:
+            monitors[current_monitor]["cm"] = line.split(": ")[1]
 
     dp2 = monitors.get("DP-2", {})
     dp1 = monitors.get("DP-1", {})
@@ -173,8 +187,12 @@ class DisplaySwitcher(Gtk.Window):
             GtkLayerShell.init_for_window(self)
             GtkLayerShell.set_layer(self, GtkLayerShell.Layer.OVERLAY)
             GtkLayerShell.set_keyboard_mode(self, GtkLayerShell.KeyboardMode.EXCLUSIVE)
-            for edge in [GtkLayerShell.Edge.TOP, GtkLayerShell.Edge.BOTTOM,
-                         GtkLayerShell.Edge.LEFT, GtkLayerShell.Edge.RIGHT]:
+            for edge in [
+                GtkLayerShell.Edge.TOP,
+                GtkLayerShell.Edge.BOTTOM,
+                GtkLayerShell.Edge.LEFT,
+                GtkLayerShell.Edge.RIGHT,
+            ]:
                 GtkLayerShell.set_anchor(self, edge, True)
                 GtkLayerShell.set_margin(self, edge, 0)
         else:
@@ -206,7 +224,8 @@ class DisplaySwitcher(Gtk.Window):
             screen = Gdk.Screen.get_default()
             if screen:
                 Gtk.StyleContext.add_provider_for_screen(
-                    screen, css_provider, Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION)
+                    screen, css_provider, Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION
+                )
         except Exception as e:
             print(f"CSS warning: {e}", file=sys.stderr)
 
@@ -329,10 +348,12 @@ class DisplaySwitcher(Gtk.Window):
         self.close()
         try:
             # Write cooldown timestamp to prevent rapid re-invocation
-            with open(COOLDOWN_FILE, 'w') as f:
+            with open(COOLDOWN_FILE, "w") as f:
                 f.write(str(time.time()))
             script = os.path.expanduser("~/.local/bin/display-apply.sh")
-            subprocess.Popen([script, selected], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            subprocess.Popen(
+                [script, selected], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
+            )
         except Exception as e:
             print(f"Error applying mode: {e}", file=sys.stderr)
 
@@ -355,18 +376,21 @@ def check_instance():
     # Check cooldown to prevent rapid re-invocation
     if os.path.exists(COOLDOWN_FILE):
         try:
-            with open(COOLDOWN_FILE, 'r') as f:
+            with open(COOLDOWN_FILE, "r") as f:
                 last_confirm = float(f.read().strip())
             elapsed = time.time() - last_confirm
             if elapsed < COOLDOWN_SECONDS:
-                print(f"Cooldown active ({COOLDOWN_SECONDS - elapsed:.1f}s remaining)", file=sys.stderr)
+                print(
+                    f"Cooldown active ({COOLDOWN_SECONDS - elapsed:.1f}s remaining)",
+                    file=sys.stderr,
+                )
                 return False, PID_FILE
         except (ValueError, OSError):
             pass
 
     if os.path.exists(PID_FILE):
         try:
-            with open(PID_FILE, 'r') as f:
+            with open(PID_FILE, "r") as f:
                 old_pid = int(f.read().strip())
             os.kill(old_pid, 0)
             os.kill(old_pid, signal.SIGUSR1)
@@ -374,7 +398,7 @@ def check_instance():
         except (ValueError, ProcessLookupError, OSError):
             pass
 
-    with open(PID_FILE, 'w') as f:
+    with open(PID_FILE, "w") as f:
         f.write(str(os.getpid()))
     return True, PID_FILE
 

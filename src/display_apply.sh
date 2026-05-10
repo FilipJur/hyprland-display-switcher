@@ -139,6 +139,36 @@ restore_dpm_auto() {
     fi
 }
 
+migrate_workspaces() {
+    local from_monitor="$1"
+    local to_monitor="$2"
+
+    local workspaces
+    workspaces=$(hyprctl workspaces -j 2>/dev/null)
+    if [[ -z "$workspaces" ]]; then
+        return
+    fi
+
+    local moved=0
+    while IFS= read -r id; do
+        [[ -z "$id" ]] && continue
+        hyprctl dispatch moveworkspacetomonitor "$id" "$to_monitor" >/dev/null 2>&1
+        ((moved++))
+    done < <(echo "$workspaces" | python3 -c "
+import json, sys
+try:
+    for ws in json.load(sys.stdin):
+        if ws.get('monitor') == '$from_monitor':
+            print(ws.get('id'))
+except Exception:
+    pass
+" 2>/dev/null)
+
+    if ((moved > 0)); then
+        log "Moved $moved workspace(s) from $from_monitor to $to_monitor"
+    fi
+}
+
 log_clocks() {
     local label="${1:-}"
     [[ -n "$label" ]] && label=" ($label)"
@@ -172,6 +202,10 @@ set_audio() {
         fi
         if [[ "$waited" -ge "$retry" ]]; then
             log "WARNING: Audio sink not found: ${sink_name}"
+            log "Available sinks:"
+            pactl list sinks short 2>/dev/null | while IFS= read -r line; do
+                log "  $line"
+            done
             return 1
         fi
         log "Audio: waiting for sink ${sink_name}... ($waited/${retry}s)"
@@ -680,21 +714,39 @@ apply_mode() {
     # Mode-specific post-processing (audio, PCON fix, etc.)
     case "$mode" in
         monitor)
+            migrate_workspaces "$TV" "$MONITOR"
             set_audio "$AUDIO_TA10R" "TA-10R (headphones)"
             ;;
         extend|mirror)
             set_audio "$AUDIO_FIIO" "FiiO E10 (desktop)"
             ;;
         tv)
+            migrate_workspaces "$MONITOR" "$TV"
             if [[ "$verify_ok" == true ]]; then
                 check_tv_scan_behavior
-                fix_pcon_hdmi_mode
-                reconfigure_dp_encoder "$TV" "$TV_RES" "0x0" "$TV_SCALE"
-                # reconfigure_dp_encoder uses hyprctl keyword monitor which wipes
-                # monitorv2 settings. Reload to restore sdr_min_luminance etc.
-                hyprctl reload
-                sleep 2
-                set_audio "$AUDIO_TV" "TV HDMI (Philips)" 10
+                
+                # Try PCON DPCD fix first (needs sudo)
+                local pcon_fixed=false
+                if fix_pcon_hdmi_mode; then
+                    pcon_fixed=true
+                    log "PCON HDMI mode fixed successfully"
+                else
+                    log "PCON fix failed, using DP encoder reconfigure fallback"
+                fi
+                
+                # If PCON fix didn't work, force DP encoder reconfig
+                if [[ "$pcon_fixed" != true ]]; then
+                    reconfigure_dp_encoder "$TV" "$TV_RES" "0x0" "$TV_SCALE"
+                    # reconfigure_dp_encoder uses hyprctl keyword monitor which wipes
+                    # monitorv2 settings. Reload to restore sdr_min_luminance etc.
+                    hyprctl reload
+                fi
+                
+                # Wait for HDMI audio sink to appear after display reconfig
+                log "Waiting for HDMI audio sink to initialize..."
+                sleep 5
+                
+                set_audio "$AUDIO_TV" "TV HDMI (Philips)" 20
                 restart_audio_sink "$AUDIO_TV"
             fi
             ;;
