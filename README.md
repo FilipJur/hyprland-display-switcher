@@ -2,6 +2,10 @@
 
 A Windows+P-style display mode switcher for Hyprland using GTK3 overlay.
 
+> **Status:** The native-HDMI two-mode refactor is designed but not implemented.
+> Current runtime code is adapter-era legacy. See [ARCHITECTURE.md](ARCHITECTURE.md)
+> for the approved design and [plan.md](plan.md) for the developer handoff.
+
 ## Installation
 
 ```bash
