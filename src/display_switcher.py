@@ -1,13 +1,10 @@
 #!/usr/bin/env python3
-"""Hyprland Display Switcher - MVP
-Zero state, detects actual monitor layout, always shows 4 modes.
-"""
+"""Hyprland Display Switcher - two-mode overlay."""
 
 import os
 import signal
 import subprocess
 import sys
-import time
 from typing import Any, Dict, List
 
 import gi
@@ -27,8 +24,7 @@ from gi.repository import Gdk, GLib, Gtk
 
 CSS_FILE = os.path.expanduser("~/.config/hypr/display-switcher.css")
 PID_FILE = os.path.expanduser("~/.local/state/display-switcher.pid")
-COOLDOWN_FILE = os.path.expanduser("~/.local/state/display-switcher.cooldown")
-COOLDOWN_SECONDS = 8
+APPLIER_SCRIPT = os.path.expanduser("~/.local/bin/display-apply.sh")
 TIMEOUT_SECONDS = 3
 
 MODES: List[Dict[str, Any]] = [
@@ -36,72 +32,15 @@ MODES: List[Dict[str, Any]] = [
         "id": "monitor",
         "name": "Monitor",
         "icon": "video-display-symbolic",
-        "desc": "SDR",
+        "desc": "3440×1440 · SDR",
     },
     {
-        "id": "extend",
-        "name": "Extend",
-        "icon": "video-joined-displays-symbolic",
-        "desc": "HDR",
+        "id": "tv",
+        "name": "TV",
+        "icon": "tv-symbolic",
+        "desc": "4K · 144 Hz · HDR · VRR",
     },
-    {"id": "mirror", "name": "Mirror", "icon": "view-mirror-symbolic", "desc": "SDR"},
-    {"id": "tv", "name": "TV", "icon": "tv-symbolic", "desc": "HDR"},
 ]
-
-ICON_FALLBACKS = {
-    "video-display-symbolic": "🖥️",
-    "video-joined-displays-symbolic": "↔️",
-    "view-mirror-symbolic": "🪞",
-    "tv-symbolic": "📺",
-}
-
-
-def detect_current_mode() -> str:
-    """Detect current mode from actual monitor layout."""
-    try:
-        output = subprocess.check_output(
-            ["hyprctl", "monitors", "all"], text=True, timeout=5
-        )
-    except (subprocess.TimeoutExpired, FileNotFoundError):
-        return "monitor"  # fallback
-
-    monitors = {}
-    current_monitor = None
-    for line in output.split("\n"):
-        line = line.strip()
-        if line.startswith("Monitor "):
-            parts = line.split()
-            if len(parts) >= 2:
-                current_monitor = parts[1]
-                monitors[current_monitor] = {
-                    "disabled": False,
-                    "mirror": None,
-                    "cm": "srgb",
-                }
-        elif line.startswith("disabled: ") and current_monitor:
-            monitors[current_monitor]["disabled"] = line.split(": ")[1] == "true"
-        elif line.startswith("mirrorOf: ") and current_monitor:
-            monitors[current_monitor]["mirror"] = line.split(": ")[1]
-        elif line.startswith("colorManagementPreset: ") and current_monitor:
-            monitors[current_monitor]["cm"] = line.split(": ")[1]
-
-    dp2 = monitors.get("DP-2", {})
-    dp1 = monitors.get("DP-1", {})
-
-    dp2_enabled = dp2.get("disabled", True) is False
-    dp1_enabled = dp1.get("disabled", True) is False
-    dp1_mirror = dp1.get("mirror", "none")
-
-    if dp2_enabled and not dp1_enabled:
-        return "monitor"
-    elif dp1_enabled and not dp2_enabled:
-        return "tv"
-    elif dp2_enabled and dp1_enabled:
-        if dp1_mirror == "DP-2":
-            return "mirror"
-        return "extend"
-
-    return "monitor"  # ultimate fallback
 
 
 class ModeButton(Gtk.Box):
@@ -110,7 +49,7 @@ class ModeButton(Gtk.Box):
         self.mode_id = mode_data["id"]
 
         self.set_name("mode-button")
-        self.set_size_request(120, 140)
+        self.set_size_request(136, 140)
         self.set_halign(Gtk.Align.CENTER)
         self.set_valign(Gtk.Align.CENTER)
 
@@ -200,9 +139,11 @@ class DisplaySwitcher(Gtk.Window):
 
         self.load_css()
 
-        # Detect actual current mode
-        self.current_mode = detect_current_mode()
+        self.current_mode = "unknown"
         self.selected_index = self.get_next_index()
+        self.selection_interacted = False
+        self.status_process = None
+        self.status_poll_id = None
         self.timeout_id = None
 
         self.build_ui()
@@ -212,7 +153,61 @@ class DisplaySwitcher(Gtk.Window):
         signal.signal(signal.SIGUSR1, self.on_cycle_signal)
 
         self.show_all()
+        self.request_status()
         self.reset_timer()
+
+    def request_status(self):
+        """Read the applier's status without blocking the GTK main loop."""
+        try:
+            self.status_process = subprocess.Popen(
+                [APPLIER_SCRIPT, "status"],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+            )
+        except (OSError, subprocess.SubprocessError) as e:
+            print(f"Error checking display status: {e}", file=sys.stderr)
+            self.set_current_mode("unknown")
+            return
+
+        self.status_poll_id = GLib.timeout_add(50, self.poll_status)
+
+    def poll_status(self):
+        process = self.status_process
+        if process is None:
+            self.status_poll_id = None
+            return False
+        if process.poll() is None:
+            return True
+
+        try:
+            stdout, stderr = process.communicate()
+        except (OSError, subprocess.SubprocessError) as e:
+            stdout = ""
+            stderr = str(e)
+
+        self.status_process = None
+        self.status_poll_id = None
+        if stderr and stderr.strip():
+            print(stderr.rstrip(), file=sys.stderr)
+
+        status = (stdout or "").strip() if process.returncode == 0 else "unknown"
+        self.set_current_mode(status)
+        return False
+
+    def set_current_mode(self, mode: str):
+        if mode not in {"monitor", "tv"}:
+            mode = "unknown"
+        self.current_mode = mode
+
+        for button in self.buttons:
+            button.set_current(button.mode_id == mode)
+
+        if not self.selection_interacted and self.buttons:
+            self.buttons[self.selected_index].set_selected(False)
+            self.selected_index = self.get_next_index()
+            self.buttons[self.selected_index].set_selected(True)
+
 
     def load_css(self):
         css_provider = Gtk.CssProvider()
@@ -244,7 +239,7 @@ class DisplaySwitcher(Gtk.Window):
             border-radius: 0;
             padding: 20px 20px 16px 20px;
             margin: 0 8px;
-            min-width: 120px;
+            min-width: 136px;
             min-height: 140px;
         }
         #mode-button.selected {
@@ -337,6 +332,7 @@ class DisplaySwitcher(Gtk.Window):
     def cycle(self):
         if not self.buttons:
             return
+        self.selection_interacted = True
         self.buttons[self.selected_index].set_selected(False)
         self.selected_index = (self.selected_index + 1) % len(self.buttons)
         self.buttons[self.selected_index].set_selected(True)
@@ -347,13 +343,7 @@ class DisplaySwitcher(Gtk.Window):
         selected = self.buttons[self.selected_index].mode_id
         self.close()
         try:
-            # Write cooldown timestamp to prevent rapid re-invocation
-            with open(COOLDOWN_FILE, "w") as f:
-                f.write(str(time.time()))
-            script = os.path.expanduser("~/.local/bin/display-apply.sh")
-            subprocess.Popen(
-                [script, selected], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
-            )
+            subprocess.Popen([APPLIER_SCRIPT, selected], stdout=subprocess.DEVNULL)
         except Exception as e:
             print(f"Error applying mode: {e}", file=sys.stderr)
 
@@ -373,21 +363,6 @@ class DisplaySwitcher(Gtk.Window):
 
 
 def check_instance():
-    # Check cooldown to prevent rapid re-invocation
-    if os.path.exists(COOLDOWN_FILE):
-        try:
-            with open(COOLDOWN_FILE, "r") as f:
-                last_confirm = float(f.read().strip())
-            elapsed = time.time() - last_confirm
-            if elapsed < COOLDOWN_SECONDS:
-                print(
-                    f"Cooldown active ({COOLDOWN_SECONDS - elapsed:.1f}s remaining)",
-                    file=sys.stderr,
-                )
-                return False, PID_FILE
-        except (ValueError, OSError):
-            pass
-
     if os.path.exists(PID_FILE):
         try:
             with open(PID_FILE, "r") as f:
