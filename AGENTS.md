@@ -126,7 +126,10 @@ HDR tuning: `sdrbrightness=1.5`, `sdrsaturation=1.01`
 - **DSC required for 4K@120Hz 10-bit**: DP 1.4 bandwidth (25.92 Gbps) can't fit uncompressed 4K@120Hz 10-bit (~30 Gbps). DSC is mandatory.
 
 ### Color Fixes Applied
-- `cm,srgb` on all DP-2 configs — prevents stale BT.2020/PQ DRM state from previous HDR mode
+- DP-2 (Philips 345E2 IPS) calibrated for accurate sRGB: `cm=srgb`, `sdr_eotf=srgb`, `sdrsaturation=1.3`
+  - `srgb` preset matches the panel's near-sRGB gamut (EDID primaries are ~93% DCI-P3, not full P3)
+  - `sdr_eotf=srgb` uses the correct sRGB piecewise transfer function (not gamma22 approximation)
+  - `sdrsaturation=1.3` compensates for the perceived flatness of correct gamut mapping vs unmanaged over-saturation
 - `cm,hdr` on all DP-1 configs — consistent HDR signaling
 - Broadcast RGB: Automatic (Full range 0-255) — confirmed via modetest
 
