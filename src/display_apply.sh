@@ -1,847 +1,552 @@
-#!/bin/bash
-# display_apply.sh - MVP display mode applier with verification
-# Zero state, 10-bit for adapter stability, logs to stdout/stderr
+#!/usr/bin/env bash
+# display_apply.sh — sole display control plane for the native-HDMI switcher.
+# Authoritative behavior: ARCHITECTURE.md ("src/display_apply.sh: sole control plane").
 #
-# TV OVERSCAN FIX:
-# If you see edges cut off in TV mode, your Philips TV is likely overscanning.
-# The EDID reports "IT scan behavior: Always Underscanned" which means PC
-# content gets scaled down. To fix:
-#   Settings → Picture → Screen Format → "Unscaled" / "Just Scan" / "Screen Fit"
-# Or on Philips 55OLED820:
-#   Settings → Channels & inputs → External Inputs → HDMI → PC Mode (enable)
+# Modes (exclusive): monitor (PHL 345E2, 3440x1440@74.98, 10-bit SDR) and
+# tv (Philips UHDTV on native HDMI, 3840x2160@144 exact, 10-bit HDR, VRR).
+# Discovery is identity-based (EDID fields + HDMI connector class); connector
+# names are runtime data only. Every apply verifies effective compositor state.
 #
-# Apps not respecting 1.5x scaling?
-#   - XWayland apps: add 'xwayland { force_zero_scaling = true }' to hyprland.conf
-#   - Native Wayland apps should scale automatically via wl_output protocol
-#   - GTK: unset GDK_SCALE (don't set it globally)
-#   - Qt: QT_AUTO_SCREEN_SCALE_FACTOR=1
+# CLI:  display_apply.sh status|monitor|tv
+# Exit: 0 success · 2 usage · 3 discovery/preflight (no mutation) ·
+#       4 apply/verification failure · 5 lock held by another apply
+# stdout: `status` token, or one success line for apply. Diagnostics: stderr + log.
+# No sudo, no kernel/DRD debugfs/sysfs access, no audio, no daemon restarts.
 
 set -uo pipefail
 
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-MODE="${1:-monitor}"
+# ---------------------------------------------------------------- constants --
 
-# Restore Hyprland IPC environment if missing (e.g., launched from a non-Hyprland shell).
-# /run/user/<uid>/hypr/<sig>/.socket.sock is created by Hyprland on startup.
-if [[ -z "${HYPRLAND_INSTANCE_SIGNATURE:-}" ]]; then
-  local_sig=$(ls -t /run/user/"$(id -u)"/hypr/ 2>/dev/null | head -1)
-  [[ -n "$local_sig" ]] && export HYPRLAND_INSTANCE_SIGNATURE="$local_sig"
-fi
+STATE_DIR="$HOME/.local/state"
+LOG_FILE="$STATE_DIR/display-switcher.log"
+LOCK_FILE="$STATE_DIR/display-apply.lock"
+CONFIG_DIR="$HOME/.config/hypr"
+GENERATED_CONFIG="$CONFIG_DIR/display-switcher-generated.conf"
 
-LOG_FILE="$HOME/.local/state/display-switcher.log"
-LOCK_FILE="$HOME/.local/state/display-apply.lock"
-# Monitor config
-MONITOR="DP-2"
-TV="DP-1"
-MONITOR_RES="3440x1440@74.98"
-TV_RES="3840x2160@120"
-TV_SCALE="1.5"
-BITDEPTH="10"
+# Role identity. Monitor: exact make/model/serial. TV: HDMI connector class
+# plus exact make/model; the dummy serial 0x01010101 is not identity.
+MON_MAKE="Philips Consumer Electronics Company"
+MON_MODEL="PHL 345E2"
+MON_SERIAL="UK02226037640"
+TV_MAKE="Philips Consumer Electronics Company"
+TV_MODEL="Philips UHDTV"
 
-# IMPORTANT: Hyprland 0.55 monitorv2 {} blocks work, but they CONFLICT
-# with legacy monitor= lines for the same output. Never write both for
-# the same physical port in the same generated config.
-#
-# Lua migration: set DISPLAY_SWITCHER_LUA=1 to generate hl.monitor() Lua
-# blocks instead of hyprlang monitorv2 {}. Requires hyprland.lua as
-# main config with require("display-switcher-generated"). Defaults to
-# hyprlang .conf for HyDE compatibility until HyDE ships Lua.
+# Verbatim full EDID descriptions for persistent selectors (never assembled
+# from separate JSON fields), so connector renumbering cannot invalidate rules.
+MONITOR_DESC="desc:Philips Consumer Electronics Company PHL 345E2 UK02226037640"
+TV_DESC="desc:Philips Consumer Electronics Company Philips UHDTV 0x01010101"
 
-# Color management presets (used by verify_mode() only)
-CM_SDR="srgb"
-CM_HDR="hdr"
+# Profiles: single source of truth for generation AND verification.
+MONITOR_PROFILE="mode=3440x1440@74.98 position=0x0 scale=1 bitdepth=10 cm=srgb sdr_eotf=srgb sdrsaturation=1.2 vrr=0"
+TV_PROFILE="mode=3840x2160@144 position=0x0 scale=1.5 bitdepth=10 cm=hdr sdrbrightness=1.0 sdrsaturation=1.0 sdr_min_luminance=0.005 sdr_max_luminance=200 min_luminance=0 max_luminance=1400 max_avg_luminance=250 supports_hdr=1 supports_wide_color=1 vrr=1"
 
-# Escape hatch for reconfigure_dp_encoder — used via hyprctl keyword monitor
-TV_HDR_OPTIONS="bitdepth,10,cm,hdr,sdrbrightness,1.0,sdrsaturation,1.0"
+POLL_INTERVAL=0.1   # seconds between polls
+POLL_MAX=50         # bounded: 50 checks at 100 ms ≈ five seconds
 
-# ------------------------------------------------------------------
-# Generated config path — extension varies by format.
-# hyprlang: display-switcher-generated.conf (sourced from hyprland.conf)
-# Lua:      display-switcher-generated.lua  (required from hyprland.lua)
-# ------------------------------------------------------------------
-USE_LUA="${DISPLAY_SWITCHER_LUA:-0}"
-if [[ "$USE_LUA" == "1" ]]; then
-  GENERATED_EXT="lua"
-  HYPR_CONFIG="$HOME/.config/hypr/hyprland.lua"
-  CHECK_SOURCE_STRING='require.*display-switcher-generated"\?\(\.conf\)\?'
-  SOURCE_LOG_LINE='  require("display-switcher-generated")  -- Lua mode'
-else
-  GENERATED_EXT="conf"
-  HYPR_CONFIG="$HOME/.config/hypr/hyprland.conf"
-  CHECK_SOURCE_STRING='source.*display-switcher-generated.conf'
-  SOURCE_LOG_LINE="  source = $HOME/.config/hypr/display-switcher-generated.conf"
-fi
-GENERATED_CONFIG="$HOME/.config/hypr/display-switcher-generated.$GENERATED_EXT"
+# ------------------------------------------------------------- runtime state --
 
-# Sourced helpers
-source "${SCRIPT_DIR}/debug-video.sh"                                # log_video_metadata()
-[[ "$USE_LUA" == "1" ]] && source "${SCRIPT_DIR}/lua-monitor-lib.sh" # lua_monitor_{active,disabled}()
+MONITORS_JSON=""
+MON_PRESENT=0 MON_ENABLED=0 MON_CONN=""
+TV_PRESENT=0 TV_ENABLED=0 TV_CONN=""
+TARGET_ROLE="" SRC_ACTIVE=0 SRC_CONN="" TGT_CONN=""
+VT_WHY="" VT_OBS=""
+PREV_PATH="" LAST_TMP="" SNAP_HDR="" SNAP_VRR=""
 
-# Audio sink names (PipeWire/ALSA)
-AUDIO_TA10R="alsa_output.usb-xDuoo_USB_Audio_2.0_TA-10R-00.analog-stereo"
-AUDIO_FIIO="alsa_output.usb-FiiO_DigiHug_USB_Audio-01.analog-stereo"
-AUDIO_TV="alsa_output.pci-0000_09_00.1.hdmi-stereo"
+# ------------------------------------------------------------------- logging --
 
 log() {
-  echo "[$(date '+%Y-%m-%d %H:%M:%S')] $*" | tee -a "$LOG_FILE"
+  printf '[%s] %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$*" | tee -a "$LOG_FILE" >&2
 }
 
-# Check TV EDID for scan behavior that causes overscan/underscan
-# Logs a warning if the TV is configured to scan PC content incorrectly
-check_tv_scan_behavior() {
-  local edid_path="/sys/class/drm/card1-DP-1/edid"
-  if [[ ! -f "$edid_path" ]]; then
-    edid_path="/sys/class/drm/card0-DP-1/edid"
-  fi
-
-  if [[ ! -f "$edid_path" ]] || ! command -v edid-decode >/dev/null 2>&1; then
-    return
-  fi
-
-  local scan_info
-  scan_info=$(edid-decode "$edid_path" 2>/dev/null | grep -E "scan behavior|Overscan|Underscan")
-  if [[ -n "$scan_info" ]]; then
-    log "TV EDID scan behavior:"
-    while IFS= read -r line; do
-      log "  $line"
-    done <<<"$scan_info"
-
-    # Warn about common overscan issues
-    if echo "$scan_info" | grep -qi "overscan"; then
-      log "WARNING: TV reports overscan behavior. If edges are cut off,"
-      log "  set TV to: Picture → Screen Format → Unscaled/Just Scan"
-    fi
-  fi
+die() { # die <exit-code> <message...>
+  local code="$1"
+  shift
+  log "ERROR($code): $*"
+  exit "$code"
 }
 
-# Simple lock file (PID-based) to prevent concurrent execution
-acquire_lock() {
-  local max_age=30 # seconds
-
-  if [[ -f "$LOCK_FILE" ]]; then
-    local old_pid
-    old_pid=$(cat "$LOCK_FILE" 2>/dev/null || true)
-    if [[ -n "$old_pid" ]] && kill -0 "$old_pid" 2>/dev/null; then
-      log "ERROR: Another instance is already running (PID: $old_pid)"
-      exit 1
-    fi
-    log "WARNING: Stale lock file found, removing"
-    rm -f "$LOCK_FILE"
-  fi
-
-  echo "$$" >"$LOCK_FILE"
+usage() {
+  cat >&2 <<'EOF'
+usage: display_apply.sh <command>
+commands:
+  status    print current mode: monitor | tv | unknown (exit 0)
+  monitor   apply the PHL 345E2 profile: 3440x1440@74.98, 10-bit SDR, scale 1
+  tv        apply the Philips UHDTV profile on native HDMI:
+            3840x2160@144, 10-bit HDR, VRR, scale 1.5 (no fallback)
+exit codes: 0 success · 2 usage · 3 discovery/preflight · 4 apply/verify · 5 lock
+EOF
+  exit 2
 }
 
-release_lock() {
-  rm -f "$LOCK_FILE"
+cleanup() {
+  [[ -n "${LAST_TMP:-}" ]] && rm -f -- "$LAST_TMP"
+  [[ -n "${PREV_PATH:-}" ]] && rm -f -- "$PREV_PATH"
 }
 
-# DPM performance level paths (card0 or card1 depending on GPU index)
-DPM_FILE="/sys/class/drm/card1/device/power_dpm_force_performance_level"
-CURRENT_FREQ_FILE="/sys/class/drm/card1/device/pp_dpm_mclk"
-if [[ ! -f "$DPM_FILE" ]]; then
-  DPM_FILE="/sys/class/drm/card0/device/power_dpm_force_performance_level"
-  CURRENT_FREQ_FILE="/sys/class/drm/card0/device/pp_dpm_mclk"
-fi
+# ------------------------------------------------------------ environment -----
 
-# Force GPU to high performance level to prevent clock transitions
-# that destabilize the CH7218 adapter during mode switches.
-# Requires display-dpm.sh sudoers rule for passwordless operation.
-DPM_HELPER="$HOME/.local/bin/display-dpm.sh"
-
-force_dpm_high() {
-  if [[ -x "$DPM_HELPER" ]]; then
-    if sudo -n "$DPM_HELPER" high 2>/dev/null; then
-      log "DPM forced to high"
-    else
-      log "WARNING: DPM force failed (sudo not configured — see AGENTS.md)"
-    fi
-  fi
-}
-
-restore_dpm_auto() {
-  if [[ -x "$DPM_HELPER" ]]; then
-    sudo -n "$DPM_HELPER" auto 2>/dev/null || true
-  fi
-}
-
-migrate_workspaces() {
-  local from_monitor="$1"
-  local to_monitor="$2"
-
-  local workspaces
-  workspaces=$(hyprctl workspaces -j 2>/dev/null)
-  if [[ -z "$workspaces" ]]; then
-    return
-  fi
-
-  local moved=0
-  while IFS= read -r id; do
-    [[ -z "$id" ]] && continue
-    hyprctl dispatch moveworkspacetomonitor "$id" "$to_monitor" >/dev/null 2>&1
-    ((moved++))
-  done < <(echo "$workspaces" | python3 -c "
-import json, sys
-try:
-    for ws in json.load(sys.stdin):
-        if ws.get('monitor') == '$from_monitor':
-            print(ws.get('id'))
-except Exception:
-    pass
-" 2>/dev/null)
-
-  if ((moved > 0)); then
-    log "Moved $moved workspace(s) from $from_monitor to $to_monitor"
-  fi
-}
-
-log_clocks() {
-  local label="${1:-}"
-  [[ -n "$label" ]] && label=" ($label)"
-  if [[ -f "$CURRENT_FREQ_FILE" ]]; then
-    local cur
-    cur=$(grep '*' "$CURRENT_FREQ_FILE" 2>/dev/null | awk '{print $2}' | tr '\n' ' ')
-    log "GPU clock state${label}: MCLK=${cur:-unknown}"
-  fi
-  if [[ -f "$DPM_FILE" ]]; then
-    log "DPM level: $(cat "$DPM_FILE" 2>/dev/null)"
-  fi
-}
-
-active_monitor_count() {
-  local monitors
-  monitors=$(hyprctl monitors -j 2>/dev/null) || {
-    echo 0
-    return
-  }
-
-  echo "$monitors" | python3 -c "
-import json, sys
-try:
-    print(sum(1 for monitor in json.load(sys.stdin) if not monitor.get('disabled')))
-except Exception:
-    print(0)
-" 2>/dev/null
-}
-
-set_audio() {
-  local sink_name="$1"
-  local label="$2"
-  local retry="${3:-0}"
-
-  if ! command -v pactl >/dev/null 2>&1; then
-    log "WARNING: pactl not available, skipping audio switch"
-    return 1
-  fi
-
-  local waited=0
-  while true; do
-    if pactl list sinks short | grep -q "${sink_name}"; then
-      pactl set-default-sink "${sink_name}" 2>/dev/null
-      pactl suspend-sink "${sink_name}" 0 2>/dev/null
-      log "Audio: ${label}"
-      return 0
-    fi
-    if [[ "$waited" -ge "$retry" ]]; then
-      log "WARNING: Audio sink not found: ${sink_name}"
-      log "Available sinks:"
-      pactl list sinks short 2>/dev/null | while IFS= read -r line; do
-        log "  $line"
-      done
-      return 1
-    fi
-    log "Audio: waiting for sink ${sink_name}... ($waited/${retry}s)"
-    sleep 1
-    ((waited++))
+require_deps() {
+  local c
+  for c in hyprctl jq flock; do
+    command -v "$c" >/dev/null 2>&1 || die 3 "required command not found: $c"
   done
 }
 
-# Restart audio PCM device to force fresh audio SDPs after PCON FRL link stabilizes
-restart_audio_sink() {
-  local sink_name="$1"
-
-  if ! command -v pactl >/dev/null 2>&1; then
-    return
-  fi
-
-  if pactl list sinks short | grep -q "${sink_name}"; then
-    log "Restarting audio stream for fresh PCON SDPs..."
-    pactl suspend-sink "${sink_name}" 1 2>/dev/null
-    sleep 2
-    pactl suspend-sink "${sink_name}" 0 2>/dev/null
-    log "Audio stream restarted"
+# Restore Hyprland IPC context when launched from a non-Hyprland shell/unit.
+ensure_ipc_sig() {
+  if [[ -z "${HYPRLAND_INSTANCE_SIGNATURE:-}" ]]; then
+    local sig
+    sig=$(ls -t /run/user/"$(id -u)"/hypr 2>/dev/null | head -1)
+    [[ -n "$sig" ]] && export HYPRLAND_INSTANCE_SIGNATURE="$sig"
   fi
 }
 
-# Fix CH7218 PCON DPCD registers for HDMI audio forwarding.
-# The amdgpu driver never sets 0x3050 (HDMI mode) and drops Source CTL on 0x305A.
-# This script sets both and polls for FRL link readiness.
-# Requires root access to /dev/drm_dp_aux0.
-fix_pcon_hdmi_mode() {
-  local script_path="${SCRIPT_DIR}/fix-pcon-audio.py"
+acquire_lock() {
+  exec 9>"$LOCK_FILE" || die 3 "cannot open lock file $LOCK_FILE"
+  flock -n 9 || die 5 "another display apply is running"
+}
 
-  if [[ ! -f "$script_path" ]]; then
-    log "WARNING: fix-pcon-audio.py not found -- skipping PCON HDMI fix"
-    return 1
-  fi
+# ---------------------------------------------------------------- discovery ---
 
-  if [[ ! -e /dev/drm_dp_aux0 ]]; then
-    log "WARNING: DPCD AUX device not found -- skipping PCON HDMI fix"
-    return 1
-  fi
+fetch_monitors() { # one structured snapshot; sets MONITORS_JSON
+  local out
+  out=$(hyprctl -j monitors all 2>/dev/null) || return 1
+  jq -e 'type == "array"' >/dev/null 2>&1 <<<"$out" || return 1
+  MONITORS_JSON="$out"
+}
 
-  log "Fixing PCON HDMI mode for audio forwarding..."
-
-  local output
-  if [[ "$(id -u)" -eq 0 ]]; then
-    output=$(python3 "$script_path" 2>&1)
-  elif command -v sudo >/dev/null 2>&1 && sudo -n true 2>/dev/null; then
-    output=$(sudo python3 "$script_path" 2>&1)
+role_match() { # role_match <role> <snapshot-json> → JSON array of matches
+  local role="$1" json="$2"
+  if [[ "$role" == monitor ]]; then
+    jq -c --arg make "$MON_MAKE" --arg model "$MON_MODEL" --arg serial "$MON_SERIAL" \
+      '[ .[] | select(.make == $make and .model == $model and .serial == $serial) ]' <<<"$json"
   else
-    log "WARNING: Cannot fix PCON HDMI mode -- root required for DPCD access"
-    log "Add to /etc/sudoers: filip ALL=(ALL) NOPASSWD: $script_path"
-    return 1
+    jq -c --arg make "$TV_MAKE" --arg model "$TV_MODEL" \
+      '[ .[] | select((.name | test("^HDMI-A-")) and .make == $make and .model == $model) ]' <<<"$json"
   fi
-
-  # Log script output
-  while IFS= read -r line; do
-    log "PCON: $line"
-  done <<<"$output"
-
-  return 0
 }
 
-# Check that the generated config is sourced (hyprlang) or required (Lua)
-# from the main config file.
-check_generated_config_sourced() {
-  if [[ ! -f "$HYPR_CONFIG" ]]; then
-    log "WARNING: $HYPR_CONFIG not found"
-    return 1
-  fi
-
-  if ! grep -q "$CHECK_SOURCE_STRING" "$HYPR_CONFIG" 2>/dev/null; then
-    log "WARNING: Generated config not sourced from $HYPR_CONFIG"
-    log "Add this line to $HYPR_CONFIG:"
-    log "  $SOURCE_LOG_LINE"
-    return 1
-  fi
-
-  return 0
-}
-
-# Write monitor configuration to the generated config file.
-# Format depends on $USE_LUA:
-#   hyprlang (default): monitorv2 {} blocks, sourced from hyprland.conf
-#   Lua (USE_LUA=1):    hl.monitor() calls, required from hyprland.lua
-#
-# CRITICAL (hyprlang mode): Never mix monitorv2 {} and monitor = lines
-# for the same output — Hyprland 0.55 conflicts them.
-write_monitor_config() {
-  local mode="$1"
-
-  # Create header with auto-generated warning
-  if [[ "$USE_LUA" == "1" ]]; then
-    cat >"$GENERATED_CONFIG" <<'HEADER'
--- AUTO-GENERATED by display_apply.sh
--- DO NOT EDIT MANUALLY — changes will be overwritten on next mode switch
--- Loaded via require("display-switcher-generated") from hyprland.lua
-
-HEADER
+# discover() fills presence/enabled/connector for both roles and rejects
+# ambiguous identities or a single connector matching both roles.
+discover() {
+  MON_ARR=$(role_match monitor "$MONITORS_JSON")
+  TV_ARR=$(role_match tv "$MONITORS_JSON")
+  local mn tn
+  mn=$(jq 'length' <<<"$MON_ARR")
+  tn=$(jq 'length' <<<"$TV_ARR")
+  (( mn <= 1 )) || die 3 "discovery error: multiple displays match the monitor identity"
+  (( tn <= 1 )) || die 3 "discovery error: multiple displays match the TV identity"
+  if (( mn )); then
+    MON_CONN=$(jq -r '.[0].name' <<<"$MON_ARR")
+    MON_ENABLED=$(jq -r 'if .[0].disabled == false then 1 else 0 end' <<<"$MON_ARR")
+    MON_PRESENT=1
   else
-    cat >"$GENERATED_CONFIG" <<'HEADER'
-# AUTO-GENERATED by display_apply.sh
-# DO NOT EDIT MANUALLY — changes will be overwritten on next mode switch
-# This file is sourced from hyprland.conf
-
-HEADER
+    MON_CONN=""; MON_PRESENT=0; MON_ENABLED=0
   fi
+  if (( tn )); then
+    TV_CONN=$(jq -r '.[0].name' <<<"$TV_ARR")
+    TV_ENABLED=$(jq -r 'if .[0].disabled == false then 1 else 0 end' <<<"$TV_ARR")
+    TV_PRESENT=1
+  else
+    TV_CONN=""; TV_PRESENT=0; TV_ENABLED=0
+  fi
+  if (( MON_PRESENT && TV_PRESENT )) && [[ "$MON_CONN" == "$TV_CONN" ]]; then
+    die 3 "discovery error: both roles matched connector $MON_CONN"
+  fi
+}
 
-  # Shared monitor field definitions (used by both formats)
-  local DP2_ACTIVE=("bitdepth = 10" "cm = srgb" "sdr_eotf = srgb" "sdrsaturation = 1.2")
-  local DP1_HDR=(
-    "bitdepth = 10"
-    "cm = hdr"
-    "sdrbrightness = 1.0"
-    "sdrsaturation = 1.0"
-    "sdr_min_luminance = 0.005"
-    "sdr_max_luminance = 200"
-    "min_luminance = 0"
-    "max_luminance = 1400"
-    "max_avg_luminance = 250"
-    "supports_hdr = 1"
-    "supports_wide_color = 1"
-  )
+role_present()  { [[ "$1" == monitor ]] && echo "$MON_PRESENT" || echo "$TV_PRESENT"; }
+role_enabled()  { [[ "$1" == monitor ]] && echo "$MON_ENABLED" || echo "$TV_ENABLED"; }
+role_conn()     { [[ "$1" == monitor ]] && echo "$MON_CONN" || echo "$TV_CONN"; }
+selector()      { [[ "$1" == monitor ]] && echo "$MONITOR_DESC" || echo "$TV_DESC"; }
+other()         { [[ "$1" == monitor ]] && echo tv || echo monitor; }
+pref_for()      { [[ "$1" == monitor ]] && echo 0 || echo 1; } # quirks:prefer_hdr
 
-  case "$mode" in
-  monitor)
-    if [[ "$USE_LUA" == "1" ]]; then
-      cat >>"$GENERATED_CONFIG" <<EOF
--- Monitor mode: DP-2 only
-EOF
-      lua_monitor_active "DP-2" "${MONITOR_RES}" "0x0" "1" "${DP2_ACTIVE[@]}" >>"$GENERATED_CONFIG"
-      lua_monitor_disabled "DP-1" >>"$GENERATED_CONFIG"
-    else
-      cat >>"$GENERATED_CONFIG" <<EOF
-# Monitor mode: DP-2 only
-monitorv2 {
-    output = DP-2
-    mode = ${MONITOR_RES}
-    position = 0x0
-    scale = 1
-    bitdepth = 10
-    cm = srgb
-    sdr_eotf = srgb
-    sdrsaturation = 1.2
+compute_status() { # truthful mode token from enabled-role state
+  if (( MON_PRESENT && MON_ENABLED )) && ! (( TV_PRESENT && TV_ENABLED )); then
+    printf 'monitor\n'
+  elif (( TV_PRESENT && TV_ENABLED )) && ! (( MON_PRESENT && MON_ENABLED )); then
+    printf 'tv\n'
+  else
+    printf 'unknown\n'
+  fi
 }
-monitorv2 {
-    output = DP-1
-    disabled = true
-}
-EOF
-    fi
-    ;;
-  extend)
-    if [[ "$USE_LUA" == "1" ]]; then
-      cat >>"$GENERATED_CONFIG" <<EOF
--- Extend mode: DP-2 primary, DP-1 to the left
-EOF
-      lua_monitor_active "DP-2" "${MONITOR_RES}" "0x0" "1" "${DP2_ACTIVE[@]}" >>"$GENERATED_CONFIG"
-      lua_monitor_active "DP-1" "${TV_RES}" "-2560x0" "${TV_SCALE}" "${DP1_HDR[@]}" >>"$GENERATED_CONFIG"
-    else
-      cat >>"$GENERATED_CONFIG" <<EOF
-# Extend mode: DP-2 primary, DP-1 to the left
-monitorv2 {
-    output = DP-2
-    mode = ${MONITOR_RES}
-    position = 0x0
-    scale = 1
-    bitdepth = 10
-    cm = srgb
-    sdr_eotf = srgb
-    sdrsaturation = 1.2
-}
-monitorv2 {
-    output = DP-1
-    mode = ${TV_RES}
-    position = -2560x0
-    scale = ${TV_SCALE}
-    bitdepth = 10
-    cm = hdr
-    sdrbrightness = 1.0
-    sdrsaturation = 1.0
-    sdr_min_luminance = 0.005
-    sdr_max_luminance = 200
-    min_luminance = 0
-    max_luminance = 1400
-    max_avg_luminance = 250
-    supports_hdr = 1
-    supports_wide_color = 1
-}
-EOF
-    fi
-    ;;
-  mirror)
-    if [[ "$USE_LUA" == "1" ]]; then
-      cat >>"$GENERATED_CONFIG" <<EOF
--- Mirror mode: DP-2 primary, DP-1 mirroring DP-2
-EOF
-      lua_monitor_active "DP-2" "${MONITOR_RES}" "0x0" "1" "${DP2_ACTIVE[@]}" >>"$GENERATED_CONFIG"
-      lua_monitor_active "DP-1" "${TV_RES}" "auto" "${TV_SCALE}" "${DP1_HDR[@]}" "mirror = DP-2" >>"$GENERATED_CONFIG"
-    else
-      cat >>"$GENERATED_CONFIG" <<EOF
-# Mirror mode: DP-2 primary, DP-1 mirroring DP-2
-monitor = DP-2,${MONITOR_RES},0x0,1,bitdepth,10,cm,srgb
-monitor = DP-1,${TV_RES},auto,${TV_SCALE},bitdepth,10,cm,${CM_HDR},mirror,DP-2
-EOF
-    fi
-    ;;
-  tv)
-    if [[ "$USE_LUA" == "1" ]]; then
-      cat >>"$GENERATED_CONFIG" <<EOF
--- TV mode: DP-1 only
-EOF
-      lua_monitor_active "DP-1" "${TV_RES}" "0x0" "${TV_SCALE}" "${DP1_HDR[@]}" >>"$GENERATED_CONFIG"
-      lua_monitor_disabled "DP-2" >>"$GENERATED_CONFIG"
-    else
-      cat >>"$GENERATED_CONFIG" <<EOF
-# TV mode: DP-1 only
-monitorv2 {
-    output = DP-1
-    mode = ${TV_RES}
-    position = 0x0
-    scale = ${TV_SCALE}
-    bitdepth = 10
-    cm = hdr
-    sdrbrightness = 1.0
-    sdrsaturation = 1.0
-    sdr_min_luminance = 0.005
-    sdr_max_luminance = 200
-    min_luminance = 0
-    max_luminance = 1400
-    max_avg_luminance = 250
-    supports_hdr = 1
-    supports_wide_color = 1
-}
-monitorv2 {
-    output = DP-2
-    disabled = true
-}
-EOF
-    fi
-    ;;
-  monitor_only)
-    if [[ "$USE_LUA" == "1" ]]; then
-      cat >>"$GENERATED_CONFIG" <<EOF
--- Reset helper: DP-2 only
-EOF
-      lua_monitor_active "DP-2" "${MONITOR_RES}" "0x0" "1" "${DP2_ACTIVE[@]}" >>"$GENERATED_CONFIG"
-      lua_monitor_disabled "DP-1" >>"$GENERATED_CONFIG"
-    else
-      cat >>"$GENERATED_CONFIG" <<EOF
-# Reset helper: DP-2 only
-monitorv2 {
-    output = DP-2
-    mode = ${MONITOR_RES}
-    position = 0x0
-    scale = 1
-    bitdepth = 10
-    cm = srgb
-    sdr_eotf = srgb
-    sdrsaturation = 1.2
-}
-monitorv2 {
-    output = DP-1
-    disabled = true
-}
-EOF
-    fi
-    ;;
-  tv_only)
-    if [[ "$USE_LUA" == "1" ]]; then
-      cat >>"$GENERATED_CONFIG" <<EOF
--- Reset helper: DP-1 only
-EOF
-      lua_monitor_active "DP-1" "${TV_RES}" "0x0" "${TV_SCALE}" "${DP1_HDR[@]}" >>"$GENERATED_CONFIG"
-      lua_monitor_disabled "DP-2" >>"$GENERATED_CONFIG"
-    else
-      cat >>"$GENERATED_CONFIG" <<EOF
-# Reset helper: DP-1 only
-monitorv2 {
-    output = DP-1
-    mode = ${TV_RES}
-    position = 0x0
-    scale = ${TV_SCALE}
-    bitdepth = 10
-    cm = hdr
-    sdrbrightness = 1.0
-    sdrsaturation = 1.0
-    sdr_min_luminance = 0.005
-    sdr_max_luminance = 200
-    min_luminance = 0
-    max_luminance = 1400
-    max_avg_luminance = 250
-    supports_hdr = 1
-    supports_wide_color = 1
-}
-monitorv2 {
-    output = DP-2
-    disabled = true
-}
-EOF
-    fi
-    ;;
-  *)
-    log "ERROR: Unknown mode in write_monitor_config: $mode"
-    return 1
-    ;;
+
+# ----------------------------------------------------------------- profiles ---
+
+prof() { # prof <role> <key> → value from the single profile definition
+  local profile kv
+  case "$1" in
+    monitor) profile="$MONITOR_PROFILE" ;;
+    tv) profile="$TV_PROFILE" ;;
+    *) return 1 ;;
   esac
-
-  log "Generated monitor config for mode: $mode (format: ${GENERATED_EXT})"
-}
-
-# Trigger DP encoder reconfiguration by toggling a display parameter.
-# This forces amdgpu to re-read PCON DPCD state and reconfigure audio SDP generation.
-# NOTE: Uses hyprctl keyword monitor directly; include bitdepth/cm because
-# omitted values fall back to 8-bit SDR defaults.
-reconfigure_dp_encoder() {
-  local display="$1"
-  local res="$2"
-  local pos="$3"
-  local scale="$4"
-
-  log "Reconfiguring DP encoder for audio SDP generation..."
-  if (($(active_monitor_count) > 1)); then
-    # Safe to toggle: disable then re-enable forces DP encoder reconfig
-    hyprctl keyword monitor "${display},disable" 2>/dev/null || true
-    sleep 1
-    hyprctl keyword monitor "${display},${res},${pos},${scale},${TV_HDR_OPTIONS}" 2>/dev/null || true
-    sleep 2
-    log "DP encoder reconfigured via keyword toggle"
-  else
-    log "Only one active monitor — reloading to trigger encoder reconfig"
-  fi
-}
-
-# Verify monitors match expected mode using text output (same as Python)
-is_tv_active() {
-  local check_format="${1:-false}"
-  local output
-  output=$(hyprctl monitors all 2>/dev/null)
-
-  local in_dp1=false
-  local dp1_disabled="true"
-  local dp1_format=""
-
-  while IFS= read -r line; do
-    line=$(echo "$line" | sed 's/^[[:space:]]*//')
-    if [[ "$line" == Monitor\ DP-1* ]]; then
-      in_dp1=true
-      dp1_disabled="false"
-    elif [[ "$line" == Monitor* ]]; then
-      # Hit a different monitor, stop processing DP-1
-      in_dp1=false
-    elif [[ "$in_dp1" == true ]] && [[ "$line" == disabled:* ]]; then
-      local val
-      val=$(echo "$line" | awk -F': ' '{print $2}')
-      if [[ "$val" == "true" ]]; then
-        dp1_disabled="true"
-      fi
-    elif [[ "$in_dp1" == true ]] && [[ "$line" == currentFormat:* ]]; then
-      dp1_format=$(echo "$line" | awk -F': ' '{print $2}')
+  for kv in $profile; do
+    if [[ "$kv" == "$2="* ]]; then
+      printf '%s' "${kv#*=}"
+      return 0
     fi
-  done <<<"$output"
-
-  if [[ "$dp1_disabled" == "false" ]]; then
-    # For 10-bit modes, verify format is actually 10-bit
-    if [[ "$check_format" == "true" ]] && [[ "$BITDEPTH" == "10" ]]; then
-      if [[ "$dp1_format" != "XRGB2101010" && "$dp1_format" != "XBGR2101010" && "$dp1_format" != "ARGB2101010" ]]; then
-        log "WARNING: TV active but format is $dp1_format (expected 10-bit)"
-        return 1
-      fi
-    fi
-    return 0
-  fi
+  done
   return 1
 }
 
-verify_mode() {
-  local expected="$1"
-  local output
-  output=$(hyprctl monitors all 2>/dev/null)
-
-  local -A monitors
-  local current_name=""
-
-  while IFS= read -r line; do
-    line=$(echo "$line" | sed 's/^[[:space:]]*//')
-
-    if [[ "$line" == Monitor* ]]; then
-      current_name=$(echo "$line" | awk '{print $2}')
-      monitors[$current_name,"disabled"]="false"
-      monitors[$current_name,"mirror"]="none"
-      monitors[$current_name,"cm"]="srgb"
-    elif [[ "$line" == disabled:* ]] && [[ -n "$current_name" ]]; then
-      local val
-      val=$(echo "$line" | awk -F': ' '{print $2}')
-      monitors[$current_name,"disabled"]="$val"
-    elif [[ "$line" == mirrorOf:* ]] && [[ -n "$current_name" ]]; then
-      local val
-      val=$(echo "$line" | awk -F': ' '{print $2}')
-      monitors[$current_name,"mirror"]="$val"
-    elif [[ "$line" == colorManagementPreset:* ]] && [[ -n "$current_name" ]]; then
-      local val
-      val=$(echo "$line" | awk -F': ' '{print $2}')
-      monitors[$current_name,"cm"]="$val"
-    fi
-  done <<<"$output"
-
-  local dp2_enabled=false
-  local dp1_enabled=false
-  local dp1_mirror="none"
-  local dp1_cm="srgb"
-
-  if [[ "${monitors[DP-2,"disabled"]:-true}" == "false" ]]; then
-    dp2_enabled=true
-  fi
-  if [[ "${monitors[DP-1,"disabled"]:-true}" == "false" ]]; then
-    dp1_enabled=true
-    dp1_mirror="${monitors[DP-1,"mirror"]:-none}"
-    dp1_cm="${monitors[DP-1,"cm"]:-srgb}"
-  fi
-
-  case "$expected" in
-  monitor)
-    [[ "$dp2_enabled" == true && "$dp1_enabled" == false ]]
-    ;;
-  extend)
-    [[ "$dp2_enabled" == true && "$dp1_enabled" == true && "$dp1_mirror" != "DP-2" && "$dp1_cm" == "$CM_HDR" ]] && is_tv_active "true"
-    ;;
-  mirror)
-    [[ "$dp2_enabled" == true && "$dp1_enabled" == true && "$dp1_mirror" == "DP-2" ]]
-    ;;
-  tv)
-    [[ "$dp2_enabled" == false && "$dp1_enabled" == true && "$dp1_cm" == "$CM_HDR" ]] && is_tv_active "true"
-    ;;
-  *)
-    return 1
-    ;;
-  esac
+emit_block() { # emit_block <role> <selector> <position-override> <disabled 0|1>
+  local role="$1" sel="$2" pos="$3" dis="$4" kv k v
+  printf 'monitorv2 {\n'
+  printf '    output = %s\n' "$sel"
+  printf '    position = %s\n' "${pos:-$(prof "$role" position)}"
+  for kv in $(prof_all "$role"); do
+    k="${kv%%=*}"
+    v="${kv#*=}"
+    case "$k" in
+      position) continue ;;
+      mode|scale|bitdepth|cm|sdr_eotf|sdrbrightness|sdrsaturation|sdr_min_luminance|sdr_max_luminance|min_luminance|max_luminance|max_avg_luminance|supports_hdr|supports_wide_color|vrr)
+        printf '    %s = %s\n' "$k" "$v" ;;
+      *) die 4 "internal error: unknown profile key '$k'" ;;
+    esac
+  done
+  (( dis )) && printf '    disabled = 1\n'
+  printf '}\n'
 }
 
-apply_mode() {
-  local mode="$1"
-  log "Applying mode: $mode (reload-based config)"
+prof_all() { # role → profile string (helper for word-split iteration)
+  [[ "$1" == monitor ]] && echo "$MONITOR_PROFILE" || echo "$TV_PROFILE"
+}
 
-  log_clocks "before switch"
-  force_dpm_high
-
-  # Ensure generated config is sourced (warn but don't fail)
-  check_generated_config_sourced || true
-
-  # Write the monitor configuration for the desired mode
-  if ! write_monitor_config "$mode"; then
-    log "ERROR: Failed to write monitor config"
-    exit 1
-  fi
-
-  # Kill layer-shell clients before reload to prevent
-  # CInputManager::refocusLastWindow SIGABRT during monitor teardown.
-  # Hyprland #14555 claimed fixed in 0.55.2 but still crashes.
-  pkill -x dunst 2>/dev/null || true
-  pkill -x swaync 2>/dev/null || true
-  pkill -x swww-daemon 2>/dev/null || true
-
-  # Apply via reload — atomic, no zero-monitor risk, preserves monitorv2 settings
-  # Toggle global HDR signaling — prefer_hdr tells Hyprland to advertise HDR
-  # support to Wayland clients. Must only be enabled when the TV is active,
-  # otherwise browsers like Helium apply HDR transfer functions to SDR content.
-  case "$mode" in
-  monitor|monitor_only)
-    hyprctl keyword quirks:prefer_hdr 0
-    log "HDR signaling disabled (SDR monitor mode)"
-    ;;
-  *)
-    hyprctl keyword quirks:prefer_hdr 1
-    log "HDR signaling enabled (TV active)"
-    ;;
-  esac
-  log "Applying monitor config via reload..."
-  hyprctl reload
-  sleep 6 # Wait for FRL link training and DSC negotiation
-
-  # Force compositor repaint after monitor reconfiguration.
-  # Without this, Hyprland sometimes renders panels but not workspace
-  # content (solitaryBlockedBy: missing candidate — compositor desync).
-  hyprctl dispatch focusmonitor "${MONITOR}" 2>/dev/null || true
-  sleep 0.2
-
-  # Verify with retry logic
-  local verify_ok=false
-  if verify_mode "$mode"; then
-    verify_ok=true
-  else
-    log "Initial reload failed verification, retrying with reset..."
-    # Retry: disable problematic display, reload, re-enable
-    local reset_mode="monitor_only"
-    if [[ "$mode" == "tv" ]]; then
-      reset_mode="monitor_only" # Reset to DP-2 only
-    elif [[ "$mode" == "monitor" ]]; then
-      reset_mode="tv_only" # Reset to DP-1 only
+# Generated file: role-dependent globals first (misc:vrr, quirks:prefer_hdr)
+# so reload-time rule creation sees them despite later-sourced base defaults,
+# then exactly two monitorv2 rules (target first). Written to a sibling temp
+# file, validated, then atomically renamed.
+write_generated() { # write_generated <target-role> <staging|final>
+  local role="$1" kind="$2" tmp blocks outs
+  local other_role pref vrr
+  other_role=$(other "$role")
+  pref=$(pref_for "$role")
+  vrr=$(prof "$role" vrr)
+  tmp="${GENERATED_CONFIG}.tmp.$$"
+  LAST_TMP="$tmp"
+  {
+    printf 'misc {\n    vrr = %s\n}\n' "$vrr"
+    printf 'quirks {\n    prefer_hdr = %s\n}\n' "$pref"
+    emit_block "$role" "$(selector "$role")" "" 0
+    if [[ "$kind" == staging && "$SRC_ACTIVE" == 1 ]]; then
+      # Keep the connected, active source at a non-overlapping position.
+      emit_block "$other_role" "$(selector "$other_role")" "auto-right" 0
     else
-      reset_mode="monitor_only" # Default reset
+      # Final state (or inactive/absent source): non-target disabled by description.
+      emit_block "$other_role" "$(selector "$other_role")" "" 1
     fi
+  } >"$tmp" || { rm -f -- "$tmp"; die 4 "failed to write generated config temp file"; }
+  [[ -s "$tmp" ]] || { rm -f -- "$tmp"; die 4 "generated config is empty"; }
+  blocks=$(grep -c '^monitorv2 {' "$tmp")
+  outs=$(grep -c '^    output = ' "$tmp")
+  [[ "$blocks" == 2 && "$outs" == 2 ]] || {
+    rm -f -- "$tmp"; die 4 "generated config invalid (blocks=$blocks outputs=$outs)"
+  }
+  mv -f -- "$tmp" "$GENERATED_CONFIG" || { rm -f -- "$tmp"; die 4 "atomic rename of generated config failed"; }
+  LAST_TMP=""
+}
 
-    write_monitor_config "$reset_mode"
-    pkill -x dunst 2>/dev/null || true
-    pkill -x swaync 2>/dev/null || true
-    pkill -x swww-daemon 2>/dev/null || true
-    hyprctl reload
-    sleep 2
+# ------------------------------------------------------------ verification ----
 
-    write_monitor_config "$mode"
-    pkill -x dunst 2>/dev/null || true
-    pkill -x swaync 2>/dev/null || true
-    pkill -x swww-daemon 2>/dev/null || true
-    hyprctl reload
-    sleep 6
+num_close() { awk -v a="$1" -v b="$2" 'BEGIN { exit !(a == b) }'; }
 
-    hyprctl dispatch focusmonitor "${MONITOR}" 2>/dev/null || true
-    sleep 0.2
+refresh_close() { # |got - want| <= 0.1
+  awk -v a="$1" -v b="$2" 'BEGIN { d = a - b; if (d < 0) d = -d; exit !(d <= 0.1) }'
+}
 
-    if verify_mode "$mode"; then
-      verify_ok=true
-      log "Mode verified after retry"
-    fi
+get_option_val() { # live int value of a keyword through IPC
+  local out
+  out=$(hyprctl -j getoption "$1" 2>/dev/null) || return 1
+  jq -er 'if type == "object" then ((.int // .str) // empty | tostring) else empty end' <<<"$out" 2>/dev/null
+}
+
+get_prefer_hdr() { get_option_val quirks:prefer_hdr; }
+get_misc_vrr()   { get_option_val misc:vrr; }
+
+verify_target() { # verify_target <role> <snapshot-json>; sets VT_WHY/VT_OBS
+  local role="$1" json="$2" arr n conn mode w h r
+  VT_WHY=""
+  arr=$(role_match "$role" "$json") || { VT_WHY="identity query failed"; return 1; }
+  n=$(jq 'length' <<<"$arr")
+  (( n == 1 )) || { VT_WHY="$role identity matches=$n (need exactly 1)"; return 1; }
+  conn=$(jq -r '.[0].name' <<<"$arr")
+  if [[ "$role" == tv && ! "$conn" =~ ^HDMI-A- ]]; then
+    VT_WHY="tv is on non-HDMI connector $conn"
+    return 1
   fi
+  mode=$(prof "$role" mode)
+  [[ "$mode" =~ ^([0-9]+)x([0-9]+)@([0-9]+(\.[0-9]+)?)$ ]] || { VT_WHY="bad profile mode '$mode'"; return 1; }
+  w=${BASH_REMATCH[1]} h=${BASH_REMATCH[2]} r=${BASH_REMATCH[3]}
+  local disabled width height rr scale fmt cm vrr dpms
+  disabled=$(jq -r '.[0].disabled' <<<"$arr")
+  width=$(jq -r '.[0].width' <<<"$arr")
+  height=$(jq -r '.[0].height' <<<"$arr")
+  rr=$(jq -r '.[0].refreshRate' <<<"$arr")
+  scale=$(jq -r '.[0].scale' <<<"$arr")
+  fmt=$(jq -r '.[0].currentFormat' <<<"$arr")
+  cm=$(jq -r '.[0].colorManagementPreset' <<<"$arr")
+  vrr=$(jq -r '.[0].vrr' <<<"$arr")
+  dpms=$(jq -r '.[0].dpmsStatus' <<<"$arr")
+  VT_OBS="$conn: disabled=$disabled ${width}x${height}@${rr} scale=$scale fmt=$fmt cm=$cm vrr=$vrr dpms=$dpms"
+  [[ "$disabled" == "false" ]] || { VT_WHY="$conn is disabled"; return 1; }
+  [[ "$dpms" == "true" ]] || { VT_WHY="$conn dpms is off"; return 1; }
+  (( width == w && height == h )) || { VT_WHY="mode ${width}x${height} != ${w}x${h}"; return 1; }
+  refresh_close "$rr" "$r" || { VT_WHY="refresh $rr not within 0.1 Hz of $r"; return 1; }
+  num_close "$scale" "$(prof "$role" scale)" || { VT_WHY="scale $scale != $(prof "$role" scale)"; return 1; }
+  if [[ "$(prof "$role" bitdepth)" == "10" ]]; then
+    case "$fmt" in
+      XRGB2101010|XBGR2101010|ARGB2101010) ;;
+      *) VT_WHY="currentFormat $fmt is not 10-bit"; return 1 ;;
+    esac
+  fi
+  [[ "$cm" == "$(prof "$role" cm)" ]] || { VT_WHY="cm $cm != $(prof "$role" cm)"; return 1; }
+  local want_vrr
+  want_vrr=$([[ "$(prof "$role" vrr)" == "1" ]] && echo true || echo false)
+  [[ "$vrr" == "$want_vrr" ]] || { VT_WHY="vrr $vrr != $want_vrr"; return 1; }
+  return 0
+}
 
-  # Mode-specific post-processing (audio, PCON fix, etc.)
-  case "$mode" in
-  monitor)
-    migrate_workspaces "$TV" "$MONITOR"
-    set_audio "$AUDIO_TA10R" "TA-10R (headphones)"
-    ;;
-  extend | mirror)
-    set_audio "$AUDIO_FIIO" "FiiO E10 (desktop)"
-    ;;
-  tv)
-    if [[ "$verify_ok" == true ]]; then
-      migrate_workspaces "$MONITOR" "$TV"
-      check_tv_scan_behavior
+verify_final() { # verify_final <role> <snapshot-json>: target profile + non-target off + global vrr/HDR prefs
+  verify_target "$@" || return 1
+  local oarr on odis hdr want vrr
+  oarr=$(role_match "$(other "$1")" "$2") || { VT_WHY="non-target query failed"; return 1; }
+  on=$(jq 'length' <<<"$oarr")
+  if (( on > 0 )); then
+    odis=$(jq -r '.[0].disabled' <<<"$oarr")
+    [[ "$odis" == "true" ]] || { VT_WHY="$(other "$1") is still enabled"; return 1; }
+  fi
+  hdr=$(get_prefer_hdr) || { VT_WHY="quirks:prefer_hdr unreadable"; return 1; }
+  want=$(pref_for "$1")
+  (( hdr == want )) || { VT_WHY="quirks:prefer_hdr=$hdr != $want"; return 1; }
+  vrr=$(get_misc_vrr) || { VT_WHY="misc:vrr unreadable"; return 1; }
+  want=$(prof "$1" vrr)
+  (( vrr == want )) || { VT_WHY="misc:vrr=$vrr != $want"; return 1; }
+  return 0
+}
 
-      # Try PCON DPCD fix first (needs sudo)
-      local pcon_fixed=false
-      if fix_pcon_hdmi_mode; then
-        pcon_fixed=true
-        log "PCON HDMI mode fixed successfully"
-      else
-        log "PCON fix failed, using DP encoder reconfigure fallback"
-      fi
+staging_ok() {
+  fetch_monitors || { VT_WHY="poll query failed"; return 1; }
+  verify_target "$TARGET_ROLE" "$MONITORS_JSON"
+}
 
-      # If PCON fix didn't work, force DP encoder reconfig
-      if [[ "$pcon_fixed" != true ]]; then
-        reconfigure_dp_encoder "$TV" "$TV_RES" "0x0" "$TV_SCALE"
-        # reconfigure_dp_encoder uses hyprctl keyword monitor which wipes
-        # monitorv2 settings. Reload to restore sdr_min_luminance etc.
-        hyprctl reload
-        sleep 2
-        hyprctl dispatch focusmonitor "${TV}" 2>/dev/null || true
-      fi
+final_ok() {
+  fetch_monitors || { VT_WHY="poll query failed"; return 1; }
+  verify_final "$TARGET_ROLE" "$MONITORS_JSON"
+}
 
-      # Wait for HDMI audio sink to appear after display reconfig
-      log "Waiting for HDMI audio sink to initialize..."
-      sleep 5
+poll_verify() { # poll_verify <predicate-fn>: check every 100 ms, at most 5 s
+  local i
+  for ((i = 0; i < POLL_MAX; i++)); do
+    if "$1"; then return 0; fi
+    sleep "$POLL_INTERVAL"
+  done
+  return 1
+}
 
-      set_audio "$AUDIO_TV" "TV HDMI (Philips)" 20
-      restart_audio_sink "$AUDIO_TV"
+apply_role_globals() { # reassert role-dependent globals through IPC after each reload
+  local role="$1" want_vrr want_pref
+  want_vrr=$(prof "$role" vrr) # global misc:vrr required value: tv=1, monitor=0
+  want_pref=$(pref_for "$role")
+  hyprctl keyword misc:vrr "$want_vrr" >/dev/null 2>&1 || return 1
+  hyprctl keyword quirks:prefer_hdr "$want_pref" >/dev/null 2>&1 || return 1
+}
+
+wake_target_if_needed() { # DPMS wake of the target, only when it is off
+  fetch_monitors || return 1
+  local on
+  on=$(jq -r --arg c "$TGT_CONN" '[.[] | select(.name == $c) | .dpmsStatus][0]' <<<"$MONITORS_JSON" 2>/dev/null)
+  [[ "$on" == "false" ]] || return 0
+  log "target $TGT_CONN dpms is off; waking"
+  hyprctl dispatch dpms on "$TGT_CONN" >/dev/null 2>&1
+}
+
+# ------------------------------------------------------------ workspaces ------
+
+migrate_workspaces() { # migrate_workspaces <from-connector> <to-connector>
+  local from="$1" to="$2" wss ids id moved=0
+  wss=$(hyprctl -j workspaces 2>/dev/null) || { log "WARNING: workspace listing failed; skipping migration"; return 0; }
+  ids=$(jq -r --arg m "$from" '.[] | select(.monitor == $m) | .id' <<<"$wss" 2>/dev/null) || return 0
+  while IFS= read -r id; do
+    [[ -n "$id" ]] || continue
+    if hyprctl dispatch moveworkspacetomonitor "$id" "$to" >/dev/null 2>&1; then
+      moved=$((moved + 1))
+    else
+      log "WARNING: failed to move workspace $id to $to"
     fi
-    ;;
+  done <<<"$ids"
+  (( moved )) && log "migrated $moved workspace(s) from $from to $to"
+  return 0
+}
+
+# ----------------------------------------------------------- rollback path ----
+
+snapshot_state() { # previous generated file (byte copy) + live globals (prefer_hdr, vrr)
+  PREV_PATH=""
+  if [[ -f "$GENERATED_CONFIG" ]]; then
+    PREV_PATH="${GENERATED_CONFIG}.prev.$$"
+    cp -f -- "$GENERATED_CONFIG" "$PREV_PATH" || die 3 "could not snapshot the generated config"
+  fi
+  SNAP_HDR=$(get_prefer_hdr || true)
+  case "$SNAP_HDR" in
+    0|1|2) ;;
+    *)
+      [[ -n "$PREV_PATH" ]] && rm -f -- "$PREV_PATH"
+      die 3 "could not read quirks:prefer_hdr before mutation"
+      ;;
   esac
+  SNAP_VRR=$(get_misc_vrr || true)
+  case "$SNAP_VRR" in
+    0|1|2|3) ;;
+    *)
+      [[ -n "$PREV_PATH" ]] && rm -f -- "$PREV_PATH"
+      die 3 "could not read misc:vrr before mutation"
+      ;;
+  esac
+}
 
-  # Wait for compositor and adapter to fully settle
-  sleep 0.5
-
-  log_clocks "after mode applied"
-  restore_dpm_auto
-
-  # Final verification
-  if [[ "$verify_ok" == true ]]; then
-    log "SUCCESS: Mode $mode verified"
-
-    # Restart layer-shell daemons killed before reload.
-    hyprctl dispatch exec swww-daemon 2>/dev/null || true
-    hyprctl dispatch exec dunst 2>/dev/null || true
-
-    exit 0
+restore_on_failure() { # restore persistent file + reload it, then snapshotted globals via IPC
+  if [[ -n "$PREV_PATH" && -f "$PREV_PATH" ]]; then
+    if mv -f -- "$PREV_PATH" "$GENERATED_CONFIG"; then
+      # The restored file enables exactly its previous target, so this reload
+      # keeps one monitor active while returning live topology to the prior
+      # exclusive state; globals are reasserted through IPC after it.
+      if hyprctl reload >/dev/null 2>&1; then
+        log "restored previous generated config and reloaded it"
+      else
+        log "ERROR: reload of restored config failed; live topology may differ from the restored file"
+      fi
+    fi
+    PREV_PATH=""
   else
-    log_clocks "after verify fail"
-    log "ERROR: Mode verification failed for $mode"
-    log_video_metadata "VERIFY_FAILED"
-    exit 1
+    rm -f -- "$GENERATED_CONFIG"
+    log "removed generated config (none existed before this apply)"
+  fi
+  if hyprctl keyword misc:vrr "$SNAP_VRR" >/dev/null 2>&1; then
+    log "restored misc:vrr=$SNAP_VRR through IPC"
+  else
+    log "ERROR: failed to restore misc:vrr through IPC"
+  fi
+  if hyprctl keyword quirks:prefer_hdr "$SNAP_HDR" >/dev/null 2>&1; then
+    log "restored quirks:prefer_hdr=$SNAP_HDR through IPC"
+  else
+    log "ERROR: failed to restore quirks:prefer_hdr through IPC"
   fi
 }
 
-# Main
-mkdir -p "$(dirname "$LOG_FILE")"
-acquire_lock
-trap release_lock EXIT
-apply_mode "$MODE"
+obs_role() { # obs_role <role> <json> → one-line observed summary
+  local arr n
+  arr=$(role_match "$1" "$2") || { echo "$1: identity query failed"; return 0; }
+  n=$(jq 'length' <<<"$arr")
+  if (( n == 0 )); then echo "$1: absent"
+  elif (( n > 1 )); then echo "$1: ambiguous($n)"
+  else
+    jq -r '"\(.[0].name): disabled=\(.[0].disabled) \(.[0].width)x\(.[0].height)@\(.[0].refreshRate) scale=\(.[0].scale) fmt=\(.[0].currentFormat) cm=\(.[0].colorManagementPreset) vrr=\(.[0].vrr)"' <<<"$arr"
+  fi
+}
+
+report_observed() { # full observed state after a failed verification
+  local json=""
+  fetch_monitors && json="$MONITORS_JSON"
+  if [[ -z "$json" ]]; then
+    log "observed state: unavailable (hyprctl query failed)"
+  else
+    log "observed state:"
+    log "  $(obs_role monitor "$json")"
+    log "  $(obs_role tv "$json")"
+  fi
+  local hdr vrr
+  hdr=$(get_prefer_hdr || true)
+  log "  quirks:prefer_hdr=${hdr:-unavailable}"
+  vrr=$(get_misc_vrr || true)
+  log "  misc:vrr=${vrr:-unavailable}"
+}
+
+fail_apply() { # fail_apply <reason> → restore, report, exit 4
+  local reason="$1"
+  log "ERROR: $reason"
+  restore_on_failure
+  report_observed
+  log "ERROR: ${TARGET_ROLE:-apply} aborted"
+  exit 4
+}
+
+# --------------------------------------------------------------- transaction --
+
+apply_flow() { # apply_flow <role> — caller holds the lock
+  local role="$1" other_role
+  other_role=$(other "$role")
+
+  fetch_monitors || die 3 "discovery failed: hyprctl -j monitors all returned no valid JSON"
+  discover
+
+  local present
+  present=$(role_present "$role")
+  (( present == 1 )) || die 3 "$role target not connected or not uniquely identified"
+
+  TGT_CONN=$(role_conn "$role")
+  SRC_ACTIVE=0
+  SRC_CONN=""
+  if [[ "$(role_present "$other_role")" == 1 && "$(role_enabled "$other_role")" == 1 ]]; then
+    SRC_ACTIVE=1
+    SRC_CONN=$(role_conn "$other_role")
+  fi
+
+  snapshot_state
+  log "applying $role mode (target=$TGT_CONN, source=$( ((SRC_ACTIVE)) && echo "$SRC_CONN" || echo none ))"
+
+  # 1) staging: target active with its final profile; any active source kept.
+  TARGET_ROLE="$role"
+  write_generated "$role" staging
+  hyprctl reload >/dev/null 2>&1 || fail_apply "staging reload command failed"
+  apply_role_globals "$role" || fail_apply "staging global apply failed (misc:vrr/quirks:prefer_hdr)"
+  wake_target_if_needed || log "WARNING: dpms wake failed; verification will catch dpms state"
+  poll_verify staging_ok || fail_apply "staging verification failed: ${VT_WHY:-target not active} (observed: ${VT_OBS:-none})"
+  log "staging verified: $role active"
+
+  # 2) move workspaces only after the target is verified active.
+  if (( SRC_ACTIVE )); then
+    migrate_workspaces "$SRC_CONN" "$TGT_CONN"
+  fi
+
+  # 3) final: target first, non-target disabled by description; full verify.
+  write_generated "$role" final
+  hyprctl reload >/dev/null 2>&1 || fail_apply "final reload command failed"
+  apply_role_globals "$role" || fail_apply "final global apply failed (misc:vrr/quirks:prefer_hdr)"
+  wake_target_if_needed || log "WARNING: dpms wake failed; verification will catch dpms state"
+  poll_verify final_ok || fail_apply "final verification failed: ${VT_WHY:-state not converged} (observed: ${VT_OBS:-none})"
+
+  rm -f -- "${PREV_PATH:-}" 2>/dev/null
+  PREV_PATH=""
+  log "$role mode applied and verified"
+  echo "$role mode applied"
+}
+
+# --------------------------------------------------------------------- main ---
+
+main() {
+  mkdir -p "$STATE_DIR" "$CONFIG_DIR"
+  trap cleanup EXIT
+
+  (( $# == 1 )) || usage
+  case "$1" in
+    status)
+      require_deps
+      ensure_ipc_sig
+      fetch_monitors || die 3 "discovery failed: hyprctl -j monitors all returned no valid JSON"
+      discover
+      compute_status
+      ;;
+    monitor|tv)
+      require_deps
+      ensure_ipc_sig
+      acquire_lock
+      apply_flow "$1"
+      ;;
+    *)
+      usage
+      ;;
+  esac
+}
+
+main "$@"
