@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Hyprland Display Switcher - two-mode overlay."""
+"""Hyprland Display Switcher - monitor, CS2, and TV modes."""
 
 import os
 import signal
@@ -33,6 +33,12 @@ MODES: List[Dict[str, Any]] = [
         "name": "Monitor",
         "icon": "video-display-symbolic",
         "desc": "3440×1440 · SDR",
+    },
+    {
+        "id": "cs2",
+        "name": "CS2",
+        "icon": "video-display-symbolic",
+        "desc": "1920×1080 · 16:9 OSD",
     },
     {
         "id": "tv",
@@ -196,7 +202,7 @@ class DisplaySwitcher(Gtk.Window):
         return False
 
     def set_current_mode(self, mode: str):
-        if mode not in {"monitor", "tv"}:
+        if mode not in {"monitor", "cs2", "tv"}:
             mode = "unknown"
         self.current_mode = mode
 
@@ -353,6 +359,7 @@ class DisplaySwitcher(Gtk.Window):
         self.timeout_id = GLib.timeout_add_seconds(TIMEOUT_SECONDS, self.on_timeout)
 
     def on_timeout(self):
+        self.timeout_id = None
         self.close()
         return False
 
@@ -360,6 +367,7 @@ class DisplaySwitcher(Gtk.Window):
         if self.timeout_id is not None:
             GLib.source_remove(self.timeout_id)
             self.timeout_id = None
+        Gtk.main_quit()
 
 
 def check_instance():
