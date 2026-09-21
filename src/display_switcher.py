@@ -37,8 +37,14 @@ MODES: List[Dict[str, Any]] = [
     {
         "id": "cs2",
         "name": "CS2",
-        "icon": "video-display-symbolic",
-        "desc": "1920×1080 · 16:9 OSD",
+        "icon": "steam_icon_730",
+        "desc": "1080p · 75 Hz · 16:9",
+    },
+    {
+        "id": "cs2-2k",
+        "name": "CS2 2K",
+        "icon": "input-gaming-symbolic",
+        "desc": "1440p · 75 Hz · 16:9",
     },
     {
         "id": "tv",
@@ -202,7 +208,7 @@ class DisplaySwitcher(Gtk.Window):
         return False
 
     def set_current_mode(self, mode: str):
-        if mode not in {"monitor", "cs2", "tv"}:
+        if mode not in {"monitor", "cs2", "cs2-2k", "tv"}:
             mode = "unknown"
         self.current_mode = mode
 
