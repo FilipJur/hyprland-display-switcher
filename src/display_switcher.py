@@ -37,14 +37,8 @@ MODES: List[Dict[str, Any]] = [
     {
         "id": "cs2",
         "name": "CS2",
-        "icon": "steam_icon_730",
+        "icon": "crosshairs",
         "desc": "1080p · 75 Hz · 16:9",
-    },
-    {
-        "id": "cs2-2k",
-        "name": "CS2 2K",
-        "icon": "input-gaming-symbolic",
-        "desc": "1440p · 75 Hz · 16:9",
     },
     {
         "id": "tv",
