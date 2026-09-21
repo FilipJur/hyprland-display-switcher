@@ -2,8 +2,9 @@
 # display_apply.sh — sole display control plane for the native-HDMI switcher.
 # Authoritative behavior: ARCHITECTURE.md ("src/display_apply.sh: sole control plane").
 #
-# Modes (exclusive): monitor (PHL 345E2, 3440x1440@74.98, 10-bit SDR) and
-# tv (Philips UHDTV on native HDMI, 3840x2160@144 exact, 10-bit HDR, VRR).
+# Modes (exclusive): monitor (PHL 345E2, 3440x1440@74.98, 8-bit SDR,
+# VRR off), cs2 (PHL 345E2, 1920x1080@60, 8-bit SDR, VRR off), and tv
+# (Philips UHDTV on native HDMI, 3840x2160@144, 10-bit HDR, VRR).
 # Discovery is identity-based (EDID fields + HDMI connector class); connector
 # names are runtime data only. Every apply verifies effective compositor state.
 #
@@ -37,9 +38,14 @@ MONITOR_DESC="desc:Philips Consumer Electronics Company PHL 345E2 UK02226037640"
 TV_DESC="desc:Philips Consumer Electronics Company Philips UHDTV 0x01010101"
 
 # Profiles: single source of truth for generation AND verification.
-MONITOR_PROFILE="mode=3440x1440@74.98 position=0x0 scale=1 bitdepth=10 cm=srgb sdr_eotf=srgb sdrsaturation=1.2 vrr=0"
+# CS2 2K signal is a custom 2560x1440@~75 modeline. A pre-start boot unit sets
+# DRM scaling mode=Full aspect(3) on DP-2; Hyprland has no aspect-preserving
+# output-scaling keyword, so the GPU scaler must add the pillarbox bars.
+MONITOR_PROFILE="mode=3440x1440@74.98 position=0x0 scale=1 bitdepth=8 cm=srgb sdr_eotf=srgb sdrsaturation=1.2 vrr=0"
 TV_PROFILE="mode=3840x2160@144 position=0x0 scale=1.5 bitdepth=10 cm=hdr sdrbrightness=1.0 sdrsaturation=1.0 sdr_min_luminance=0.005 sdr_max_luminance=200 min_luminance=0 max_luminance=1400 max_avg_luminance=250 supports_hdr=1 supports_wide_color=1 vrr=1"
-
+CS2_PROFILE="mode=1920x1080@60 position=0x0 scale=1 bitdepth=8 cm=srgb sdr_eotf=srgb sdrsaturation=1.2 vrr=0"
+CS2_2K_MODELINE="modeline 397.25 2560 2760 3040 3520 1440 1443 1448 1506 -hsync +vsync"
+CS2_2K_PROFILE="position=0x0 scale=1 bitdepth=8 cm=srgb sdr_eotf=srgb sdrsaturation=1.2 vrr=0"
 POLL_INTERVAL=0.1   # seconds between polls
 POLL_MAX=50         # bounded: 50 checks at 100 ms ≈ five seconds
 
@@ -67,13 +73,19 @@ die() { # die <exit-code> <message...>
 
 usage() {
   cat >&2 <<'EOF'
-usage: display_apply.sh <command>
+usage: display-apply.sh <command>
 commands:
-  status    print current mode: monitor | tv | unknown (exit 0)
-  monitor   apply the PHL 345E2 profile: 3440x1440@74.98, 10-bit SDR, scale 1
+  monitor   apply the PHL 345E2 profile: 3440x1440@74.98, 8-bit SDR, VRR
+            off, scale 1
+  cs2       apply the PHL 345E2 CS2 profile: 1920x1080@60, 8-bit SDR, VRR
+            off, scale 1
+  cs2-2k    apply the PHL 345E2 CS2 2K profile: custom 2560x1440@~75
+            modeline, 8-bit SDR, VRR off, scale 1 (needs pre-start
+            DRM scaling mode=Full aspect for side bars)
   tv        apply the Philips UHDTV profile on native HDMI:
             3840x2160@144, 10-bit HDR, VRR, scale 1.5 (no fallback)
-exit codes: 0 success · 2 usage · 3 discovery/preflight · 4 apply/verify · 5 lock
+exit codes: 0 success · 2 usage · 3 discovery/preflight (no mutation) ·
+4 apply/verify · 5 lock
 EOF
   exit 2
 }
@@ -117,7 +129,7 @@ fetch_monitors() { # one structured snapshot; sets MONITORS_JSON
 
 role_match() { # role_match <role> <snapshot-json> → JSON array of matches
   local role="$1" json="$2"
-  if [[ "$role" == monitor ]]; then
+  if [[ "$role" == monitor || "$role" == cs2 || "$role" == cs2-2k ]]; then
     jq -c --arg make "$MON_MAKE" --arg model "$MON_MODEL" --arg serial "$MON_SERIAL" \
       '[ .[] | select(.make == $make and .model == $model and .serial == $serial) ]' <<<"$json"
   else
@@ -155,32 +167,59 @@ discover() {
   fi
 }
 
-role_present()  { [[ "$1" == monitor ]] && echo "$MON_PRESENT" || echo "$TV_PRESENT"; }
-role_enabled()  { [[ "$1" == monitor ]] && echo "$MON_ENABLED" || echo "$TV_ENABLED"; }
-role_conn()     { [[ "$1" == monitor ]] && echo "$MON_CONN" || echo "$TV_CONN"; }
-selector()      { [[ "$1" == monitor ]] && echo "$MONITOR_DESC" || echo "$TV_DESC"; }
-other()         { [[ "$1" == monitor ]] && echo tv || echo monitor; }
-pref_for()      { [[ "$1" == monitor ]] && echo 0 || echo 1; } # quirks:prefer_hdr
+role_present() {
+  [[ "$1" == monitor || "$1" == cs2 || "$1" == cs2-2k ]] && echo "$MON_PRESENT" || echo "$TV_PRESENT"
+}
+role_enabled() {
+  [[ "$1" == monitor || "$1" == cs2 || "$1" == cs2-2k ]] && echo "$MON_ENABLED" || echo "$TV_ENABLED"
+}
+role_conn() {
+  [[ "$1" == monitor || "$1" == cs2 || "$1" == cs2-2k ]] && echo "$MON_CONN" || echo "$TV_CONN"
+}
+selector() {
+  [[ "$1" == tv ]] && echo "$TV_DESC" || echo "$MONITOR_DESC"
+}
+other() {
+  [[ "$1" == tv ]] && echo monitor || echo tv
+}
+pref_for() {
+  [[ "$1" == tv ]] && echo 1 || echo 0
+}
 
-compute_status() { # truthful mode token from enabled-role state
-  if (( MON_PRESENT && MON_ENABLED )) && ! (( TV_PRESENT && TV_ENABLED )); then
-    printf 'monitor\n'
-  elif (( TV_PRESENT && TV_ENABLED )) && ! (( MON_PRESENT && MON_ENABLED )); then
+compute_status() {
+  if (( TV_PRESENT && TV_ENABLED )) && ! (( MON_PRESENT && MON_ENABLED )); then
     printf 'tv\n'
+  elif (( MON_PRESENT && MON_ENABLED )) && ! (( TV_PRESENT && TV_ENABLED )); then
+    local arr width height refresh
+    arr=$(role_match monitor "$MONITORS_JSON")
+    width=$(jq -r '.[0].width' <<<"$arr")
+    height=$(jq -r '.[0].height' <<<"$arr")
+    refresh=$(jq -r '.[0].refreshRate' <<<"$arr")
+    if [[ "$width" == 1920 && "$height" == 1080 && "$refresh" == 60* ]]; then
+      printf 'cs2\n'
+    elif [[ "$width" == 2560 && "$height" == 1440 ]]; then
+      printf 'cs2-2k\n'
+    else
+      printf 'monitor\n'
+    fi
   else
     printf 'unknown\n'
   fi
 }
 
-# ----------------------------------------------------------------- profiles ---
-
 prof() { # prof <role> <key> → value from the single profile definition
   local profile kv
   case "$1" in
     monitor) profile="$MONITOR_PROFILE" ;;
+    cs2) profile="$CS2_PROFILE" ;;
+    cs2-2k) profile="$CS2_2K_PROFILE" ;;
     tv) profile="$TV_PROFILE" ;;
     *) return 1 ;;
   esac
+  if [[ "$1" == cs2-2k && "$2" == mode ]]; then
+    printf '%s' "$CS2_2K_MODELINE"
+    return 0
+  fi
   for kv in $profile; do
     if [[ "$kv" == "$2="* ]]; then
       printf '%s' "${kv#*=}"
@@ -195,12 +234,13 @@ emit_block() { # emit_block <role> <selector> <position-override> <disabled 0|1>
   printf 'monitorv2 {\n'
   printf '    output = %s\n' "$sel"
   printf '    position = %s\n' "${pos:-$(prof "$role" position)}"
+  printf '    mode = %s\n' "$(prof "$role" mode)"
   for kv in $(prof_all "$role"); do
     k="${kv%%=*}"
     v="${kv#*=}"
     case "$k" in
-      position) continue ;;
-      mode|scale|bitdepth|cm|sdr_eotf|sdrbrightness|sdrsaturation|sdr_min_luminance|sdr_max_luminance|min_luminance|max_luminance|max_avg_luminance|supports_hdr|supports_wide_color|vrr)
+      position|mode) continue ;;
+      scale|bitdepth|cm|sdr_eotf|sdrbrightness|sdrsaturation|sdr_min_luminance|sdr_max_luminance|min_luminance|max_luminance|max_avg_luminance|supports_hdr|supports_wide_color|vrr)
         printf '    %s = %s\n' "$k" "$v" ;;
       *) die 4 "internal error: unknown profile key '$k'" ;;
     esac
@@ -210,7 +250,13 @@ emit_block() { # emit_block <role> <selector> <position-override> <disabled 0|1>
 }
 
 prof_all() { # role → profile string (helper for word-split iteration)
-  [[ "$1" == monitor ]] && echo "$MONITOR_PROFILE" || echo "$TV_PROFILE"
+  case "$1" in
+    monitor) echo "$MONITOR_PROFILE" ;;
+    cs2) echo "$CS2_PROFILE" ;;
+    cs2-2k) echo "$CS2_2K_PROFILE" ;;
+    tv) echo "$TV_PROFILE" ;;
+    *) return 1 ;;
+  esac
 }
 
 # Generated file: role-dependent globals first (misc:vrr, quirks:prefer_hdr)
@@ -276,8 +322,13 @@ verify_target() { # verify_target <role> <snapshot-json>; sets VT_WHY/VT_OBS
     return 1
   fi
   mode=$(prof "$role" mode)
-  [[ "$mode" =~ ^([0-9]+)x([0-9]+)@([0-9]+(\.[0-9]+)?)$ ]] || { VT_WHY="bad profile mode '$mode'"; return 1; }
-  w=${BASH_REMATCH[1]} h=${BASH_REMATCH[2]} r=${BASH_REMATCH[3]}
+  if [[ "$mode" =~ ^modeline[[:space:]] ]]; then
+    w=2560; h=1440; r=74.89
+  elif [[ "$mode" =~ ^([0-9]+)x([0-9]+)@([0-9]+(\.[0-9]+)?)$ ]]; then
+    w=${BASH_REMATCH[1]} h=${BASH_REMATCH[2]} r=${BASH_REMATCH[3]}
+  else
+    VT_WHY="bad profile mode '$mode'"; return 1
+  fi
   local disabled width height rr scale fmt cm vrr dpms
   disabled=$(jq -r '.[0].disabled' <<<"$arr")
   width=$(jq -r '.[0].width' <<<"$arr")
@@ -537,7 +588,7 @@ main() {
       discover
       compute_status
       ;;
-    monitor|tv)
+    monitor|cs2|cs2-2k|tv)
       require_deps
       ensure_ipc_sig
       acquire_lock
