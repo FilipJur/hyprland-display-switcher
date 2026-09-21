@@ -38,12 +38,13 @@ MONITOR_DESC="desc:Philips Consumer Electronics Company PHL 345E2 UK02226037640"
 TV_DESC="desc:Philips Consumer Electronics Company Philips UHDTV 0x01010101"
 
 # Profiles: single source of truth for generation AND verification.
-# CS2 2K signal is a custom 2560x1440@~75 modeline. A pre-start boot unit sets
-# DRM scaling mode=Full aspect(3) on DP-2; Hyprland has no aspect-preserving
-# output-scaling keyword, so the GPU scaler must add the pillarbox bars.
+# Patched Aquamarine emits DRM scaling mode=Full aspect(3), so non-native
+# modes center with side bars instead of stretching. CS2 is 1920x1080@~75
+# (upscaled full-height to 2560x1440 by the GPU); CS2 2K is native 2560x1440@~75.
 MONITOR_PROFILE="mode=3440x1440@74.98 position=0x0 scale=1 bitdepth=8 cm=srgb sdr_eotf=srgb sdrsaturation=1.2 vrr=0"
 TV_PROFILE="mode=3840x2160@144 position=0x0 scale=1.5 bitdepth=10 cm=hdr sdrbrightness=1.0 sdrsaturation=1.0 sdr_min_luminance=0.005 sdr_max_luminance=200 min_luminance=0 max_luminance=1400 max_avg_luminance=250 supports_hdr=1 supports_wide_color=1 vrr=1"
-CS2_PROFILE="mode=1920x1080@60 position=0x0 scale=1 bitdepth=8 cm=srgb sdr_eotf=srgb sdrsaturation=1.2 vrr=0"
+CS2_MODELINE="modeline 220.75 1920 2056 2264 2608 1080 1083 1088 1130 -hsync +vsync"
+CS2_PROFILE="position=0x0 scale=1 bitdepth=8 cm=srgb sdr_eotf=srgb sdrsaturation=1.2 vrr=0"
 CS2_2K_MODELINE="modeline 397.25 2560 2760 3040 3520 1440 1443 1448 1506 -hsync +vsync"
 CS2_2K_PROFILE="position=0x0 scale=1 bitdepth=8 cm=srgb sdr_eotf=srgb sdrsaturation=1.2 vrr=0"
 POLL_INTERVAL=0.1   # seconds between polls
@@ -77,11 +78,12 @@ usage: display-apply.sh <command>
 commands:
   monitor   apply the PHL 345E2 profile: 3440x1440@74.98, 8-bit SDR, VRR
             off, scale 1
-  cs2       apply the PHL 345E2 CS2 profile: 1920x1080@60, 8-bit SDR, VRR
-            off, scale 1
+  cs2       apply the PHL 345E2 CS2 profile: custom 1920x1080@~75
+            modeline, 8-bit SDR, VRR off, scale 1 (GPU Full aspect
+            pillarbox, needs patched Aquamarine)
   cs2-2k    apply the PHL 345E2 CS2 2K profile: custom 2560x1440@~75
-            modeline, 8-bit SDR, VRR off, scale 1 (needs pre-start
-            DRM scaling mode=Full aspect for side bars)
+            modeline, 8-bit SDR, VRR off, scale 1 (GPU Full aspect
+            pillarbox, needs patched Aquamarine)
   tv        apply the Philips UHDTV profile on native HDMI:
             3840x2160@144, 10-bit HDR, VRR, scale 1.5 (no fallback)
 exit codes: 0 success · 2 usage · 3 discovery/preflight (no mutation) ·
@@ -195,7 +197,7 @@ compute_status() {
     width=$(jq -r '.[0].width' <<<"$arr")
     height=$(jq -r '.[0].height' <<<"$arr")
     refresh=$(jq -r '.[0].refreshRate' <<<"$arr")
-    if [[ "$width" == 1920 && "$height" == 1080 && "$refresh" == 60* ]]; then
+    if [[ "$width" == 1920 && "$height" == 1080 ]]; then
       printf 'cs2\n'
     elif [[ "$width" == 2560 && "$height" == 1440 ]]; then
       printf 'cs2-2k\n'
@@ -216,6 +218,10 @@ prof() { # prof <role> <key> → value from the single profile definition
     tv) profile="$TV_PROFILE" ;;
     *) return 1 ;;
   esac
+  if [[ "$1" == cs2 && "$2" == mode ]]; then
+    printf '%s' "$CS2_MODELINE"
+    return 0
+  fi
   if [[ "$1" == cs2-2k && "$2" == mode ]]; then
     printf '%s' "$CS2_2K_MODELINE"
     return 0
@@ -322,8 +328,10 @@ verify_target() { # verify_target <role> <snapshot-json>; sets VT_WHY/VT_OBS
     return 1
   fi
   mode=$(prof "$role" mode)
-  if [[ "$mode" =~ ^modeline[[:space:]] ]]; then
+  if [[ "$mode" =~ ^modeline[[:space:]]+[0-9.]+[[:space:]]+2560[[:space:]] ]]; then
     w=2560; h=1440; r=74.89
+  elif [[ "$mode" =~ ^modeline[[:space:]]+[0-9.]+[[:space:]]+1920[[:space:]] ]]; then
+    w=1920; h=1080; r=74.65
   elif [[ "$mode" =~ ^([0-9]+)x([0-9]+)@([0-9]+(\.[0-9]+)?)$ ]]; then
     w=${BASH_REMATCH[1]} h=${BASH_REMATCH[2]} r=${BASH_REMATCH[3]}
   else
