@@ -1,0 +1,62 @@
+# PKGBUILD - locally patched aquamarine (scaling-mode-3)
+#
+# Why: on the AMD Navi 21 DP-2 connector, aquamarine never emits the DRM
+# connector property "scaling mode" (None=0, Full=1, Center=2, Full aspect=3).
+# Without it, a non-native mode is stretched by the panel. amdgpu maps
+# scaling mode 3 to RMX_ASPECT and does the aspect-preserving scaling on the
+# GPU with a centered destination rect, which the panel cannot override.
+#
+# pkgrel is deliberately 99 instead of 1: the repository package is
+# aquamarine-0.15.1-2, so a numerically lower pkgrel would let the next
+# `pacman -Syu` replace this patched build with the unpatched one. 0.15.1-99
+# is strictly newer, so pacman keeps it.
+pkgname=aquamarine
+pkgver=0.15.1
+pkgrel=99
+pkgdesc="a very light linux rendering backend library"
+arch=('x86_64')
+url="https://github.com/hyprwm/aquamarine"
+license=('BSD-3-Clause')
+depends=('hyprutils' 'libdisplay-info' 'libdrm' 'libglvnd' 'libinput' 'mesa'
+         'opengl-driver' 'pixman' 'seatd' 'systemd-libs' 'wayland'
+         'wayland-protocols')
+makedepends=('cmake' 'git' 'hyprwayland-scanner' 'pkgconf')
+# VCS source pinned to the released tag, so a build is reproducible without
+# shipping a tarball in this repository. makepkg checks v0.15.1 out into
+# $srcdir/aquamarine (the repository name, i.e. $pkgname).
+#
+# scaling-mode-3.patch is NOT generated here: it is produced from the
+# implementation tree (the v0.15.1 checkout carrying the DRM.hpp / Props.cpp
+# changes) with
+#
+#   git -C <implementation tree> diff > scaling-mode-3.patch
+#
+# and MUST exist next to this PKGBUILD before `makepkg` is run. Its checksum is
+# SKIP because the patch keeps changing until the implementation is frozen.
+source=("git+$url.git#tag=v$pkgver"
+        "scaling-mode-3.patch")
+sha256sums=('SKIP'
+            'SKIP')
+
+prepare() {
+    cd "$srcdir/$pkgname"
+
+    # Applied from $srcdir: makepkg stages local source entries (the patch)
+    # there, and this directory is $srcdir/aquamarine.
+    patch -p1 < ../scaling-mode-3.patch
+}
+
+build() {
+    cd "$srcdir/$pkgname"
+
+    cmake -B build -S . \
+        -DCMAKE_BUILD_TYPE=Release \
+        -DCMAKE_INSTALL_PREFIX=/usr
+    cmake --build build
+}
+
+package() {
+    cd "$srcdir/$pkgname"
+
+    DESTDIR="$pkgdir" cmake --install build
+}

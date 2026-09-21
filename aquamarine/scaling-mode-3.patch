@@ -1,0 +1,128 @@
+diff --git a/include/aquamarine/backend/DRM.hpp b/include/aquamarine/backend/DRM.hpp
+index 281f13f..87ac2f1 100644
+--- a/include/aquamarine/backend/DRM.hpp
++++ b/include/aquamarine/backend/DRM.hpp
+@@ -330,6 +330,7 @@ namespace Aquamarine {
+             uint64_t colorspace  = 0;
+             uint16_t contentType = 0;
+             uint32_t crtcID      = 0;
++            uint64_t scalingMode = 0;
+ 
+             // true if the max_bpc property was actually added to the atomic request
+             // (i.e. not skipped as an unchanged cached value on a page-flip). only when
+@@ -408,6 +409,7 @@ namespace Aquamarine {
+             uint64_t          colorspace  = 0;
+             uint16_t          contentType = 0;
+             uint32_t          crtcID      = 0;
++            uint64_t          scalingMode = 0;
+             bool              propsCached = false;
+             eOutputColorRange colorRange  = AQ_OUTPUT_COLOR_RANGE_AUTO;
+         } atomic;
+@@ -427,12 +429,13 @@ namespace Aquamarine {
+                 uint32_t Colorspace;          // not guaranteed to exist
+                 uint32_t hdr_output_metadata; // not guaranteed to exist
+                 uint32_t tile;                // not guaranteed to exist
++                uint32_t scaling_mode;        // not guaranteed to exist
+ 
+                 // atomic-modesetting only
+ 
+                 uint32_t crtc_id;
+             } values;
+-            uint32_t props[14] = {0};
++            uint32_t props[15] = {0};
+         };
+         UDRMConnectorProps props;
+ 
+diff --git a/src/backend/drm/Props.cpp b/src/backend/drm/Props.cpp
+index 4c1e3cf..432fc00 100644
+--- a/src/backend/drm/Props.cpp
++++ b/src/backend/drm/Props.cpp
+@@ -32,6 +32,7 @@ static const struct prop_info connector_info[] = {
+     {.name = "max bpc", .index = INDEX(max_bpc)},
+     {.name = "non-desktop", .index = INDEX(non_desktop)},
+     {.name = "panel orientation", .index = INDEX(panel_orientation)},
++    {.name = "scaling mode", .index = INDEX(scaling_mode)},
+     {.name = "subconnector", .index = INDEX(subconnector)},
+     {.name = "vrr_capable", .index = INDEX(vrr_capable)},
+ #undef INDEX
+diff --git a/src/backend/drm/impl/Atomic.cpp b/src/backend/drm/impl/Atomic.cpp
+index e47781b..c958420 100644
+--- a/src/backend/drm/impl/Atomic.cpp
++++ b/src/backend/drm/impl/Atomic.cpp
+@@ -1,6 +1,7 @@
+ #include <aquamarine/backend/drm/Atomic.hpp>
+ #include <cerrno>
+ #include <cstdint>
++#include <cstdlib>
+ #include <cstring>
+ #include <drm_mode.h>
+ #include <xf86drm.h>
+@@ -251,6 +252,7 @@ void Aquamarine::CDRMAtomicRequest::addConnector(Hyprutils::Memory::CSharedPoint
+     const bool     forceConnProps = data.modeset || !connector->atomic.propsCached;
+     const uint32_t newCrtcID      = enable ? connector->crtc->id : 0;
+     uint64_t       newMaxBpc = 0, newColorspace = 0;
++    uint64_t       newScalingMode = 0;
+     uint16_t       newContentType = 0;
+     bool           maxBpcEmitted  = false;
+ 
+@@ -280,6 +282,28 @@ void Aquamarine::CDRMAtomicRequest::addConnector(Hyprutils::Memory::CSharedPoint
+                 add(connector->id, connector->props.values.Colorspace, newColorspace);
+         }
+ 
++        if (connector->props.values.scaling_mode) {
++            // Full aspect (3) is what amdgpu maps to RMX_ASPECT: the GPU scales into
++            // a centered dest rect, and the panel's own scaler cannot override it.
++            newScalingMode = 3; // DRM_MODE_SCALE_ASPECT / Full aspect (amdgpu RMX_ASPECT)
++            if (const char* e = getenv("AQ_SCALING_MODE")) {
++                if (!strcmp(e, "off"))
++                    newScalingMode = 0;
++                else if (e[0] >= '0' && e[0] <= '3' && e[1] == '\0')
++                    newScalingMode = e[0] - '0';
++            }
++
++            // connector->atomic.scalingMode caches the value the kernel last accepted,
++            // so an unchanged scalingMode is skipped on page-flips (see #265).
++            const bool scalingModeChanged = forceConnProps || connector->atomic.scalingMode != newScalingMode;
++            const bool scalingModeOff     = newScalingMode == 0 && (forceConnProps || connector->atomic.scalingMode != 0);
++
++            if (scalingModeChanged && newScalingMode != 0)
++                add(connector->id, connector->props.values.scaling_mode, newScalingMode);
++            else if (scalingModeOff)
++                add(connector->id, connector->props.values.scaling_mode, 0);
++        }
++
+         if (connector->props.values.hdr_output_metadata && data.atomic.hdrd)
+             add(connector->id, connector->props.values.hdr_output_metadata, data.atomic.hdrBlob);
+     } else
+@@ -299,6 +323,7 @@ void Aquamarine::CDRMAtomicRequest::addConnector(Hyprutils::Memory::CSharedPoint
+     data.atomic.maxBpc        = newMaxBpc;
+     data.atomic.maxBpcEmitted = maxBpcEmitted;
+     data.atomic.colorspace    = newColorspace;
++    data.atomic.scalingMode   = newScalingMode;
+     data.atomic.contentType   = newContentType;
+     data.atomic.crtcID        = newCrtcID;
+ 
+@@ -491,6 +516,7 @@ void Aquamarine::CDRMAtomicImpl::finalizeAsync(CDRMAtomicRequest& request, SP<SD
+     request.apply(data);
+     connector->atomic.maxBpc      = data.atomic.maxBpc;
+     connector->atomic.colorspace  = data.atomic.colorspace;
++    connector->atomic.scalingMode = data.atomic.scalingMode;
+     connector->atomic.contentType = data.atomic.contentType;
+     connector->atomic.crtcID      = data.atomic.crtcID;
+     connector->atomic.propsCached = true;
+@@ -671,6 +697,7 @@ bool Aquamarine::CDRMAtomicImpl::commit(Hyprutils::Memory::CSharedPointer<SDRMCo
+             if (!data.test) {
+                 connector->atomic.maxBpc      = data.atomic.maxBpc;
+                 connector->atomic.colorspace  = data.atomic.colorspace;
++                connector->atomic.scalingMode = data.atomic.scalingMode;
+                 connector->atomic.contentType = data.atomic.contentType;
+                 connector->atomic.crtcID      = data.atomic.crtcID;
+                 connector->atomic.propsCached = true;
+@@ -720,6 +747,7 @@ bool Aquamarine::CDRMAtomicImpl::commit(Hyprutils::Memory::CSharedPointer<SDRMCo
+             // next page-flip can skip emitting unchanged ones (see #265).
+             connector->atomic.maxBpc      = data.atomic.maxBpc;
+             connector->atomic.colorspace  = data.atomic.colorspace;
++            connector->atomic.scalingMode = data.atomic.scalingMode;
+             connector->atomic.contentType = data.atomic.contentType;
+             connector->atomic.crtcID      = data.atomic.crtcID;
+             connector->atomic.propsCached = true;
