@@ -1,0 +1,13 @@
+[Unit]
+Description=Set DRM connector scaling mode to Full aspect before display manager
+After=systemd-udev-settle.service home.mount
+Before=display-manager.service graphical.target
+DefaultDependencies=no
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/local/bin/drm-scaling-early.sh
+
+[Install]
+WantedBy=multi-user.target
