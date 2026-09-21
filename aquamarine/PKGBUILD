@@ -14,13 +14,13 @@ pkgname=aquamarine
 pkgver=0.15.1
 pkgrel=99
 pkgdesc="a very light linux rendering backend library"
+license=('BSD-3-Clause')
 arch=('x86_64')
 url="https://github.com/hyprwm/aquamarine"
-license=('BSD-3-Clause')
 depends=('hyprutils' 'libdisplay-info' 'libdrm' 'libglvnd' 'libinput' 'mesa'
          'opengl-driver' 'pixman' 'seatd' 'systemd-libs' 'wayland'
          'wayland-protocols')
-makedepends=('cmake' 'git' 'hyprwayland-scanner' 'pkgconf')
+provides=('libaquamarine.so=14-64')
 # VCS source pinned to the released tag, so a build is reproducible without
 # shipping a tarball in this repository. makepkg checks v0.15.1 out into
 # $srcdir/aquamarine (the repository name, i.e. $pkgname).
@@ -33,7 +33,7 @@ makedepends=('cmake' 'git' 'hyprwayland-scanner' 'pkgconf')
 #
 # and MUST exist next to this PKGBUILD before `makepkg` is run. Its checksum is
 # SKIP because the patch keeps changing until the implementation is frozen.
-source=("git+$url.git#tag=v$pkgver"
+source=("git+${url}.git#tag=v${pkgver}"
         "scaling-mode-3.patch")
 sha256sums=('SKIP'
             'SKIP')
