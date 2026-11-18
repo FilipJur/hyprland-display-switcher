@@ -2,22 +2,22 @@
 
 ## Status
 
-Implemented and live. The code under `src/` follows this document; the adapter-era runtime was deleted in the cutover.
+Implemented and live. The code under `src/` follows this document; the adapter-era runtime and the fixed-mode commands were removed in clean cutovers.
 
-The product scope is five exclusive modes across two display roles:
+Two displays, each configured per apply:
 
-- `monitor`, `cs2`, `cs2-2k`: Philips 345E2 active; TV disabled. `cs2` and `cs2-2k` run the monitor at a custom ~75 Hz modeline with GPU Full-aspect pillarbox (patched Aquamarine required).
-- `tv`, `tv-alt`: Philips 55OLED820 active over native HDMI 2.1; monitor disabled. `tv-alt` is `tv` with VRR off.
+- `monitor`: Philips PHL 345E2. Defaults `res=3440x1440 hz=74.98 vrr=0 hdr=0 scale=1`.
+- `tv`: Philips 55OLED820 ("Philips UHDTV") over native HDMI 2.1. Defaults `res=3840x2160 hz=144 vrr=1 hdr=1 scale=1.5`.
 
-There is no Extend mode, Mirror mode, audio routing, or adapter recovery. The only automatic switch is the `ensure` failover, which acts solely when no known display is enabled and never changes an active one.
+An apply targets one display and sets resolution, refresh, VRR, HDR, and scale; omitted keys take that display's defaults. There is no Extend mode, Mirror mode, audio routing, or adapter recovery. The only automatic switch is the `ensure` failover, which applies a display's defaults solely when no known display is enabled.
 
 ## Goals
 
-1. Switch safely between the exclusive display modes from the existing GTK overlay.
+1. Configure and switch either display safely from the existing GTK overlay.
 2. Identify displays by EDID identity and connector class, not fixed DRM connector names.
-3. Apply TV mode as 3840×2160 at 144 Hz, 10-bit, HDR, and VRR over native HDMI.
+3. Reach TV settings up to 3840×2160 at 144 Hz, 10-bit, HDR, and VRR over native HDMI.
 4. Verify the effective compositor state rather than assuming a successful `hyprctl` exit means the mode applied.
-5. Fail before changing topology when required hardware or the exact target mode is unavailable.
+5. Fail before changing topology when the requested display or mode is unavailable.
 6. Keep the implementation small enough to audit as a hardware control path.
 
 ## Non-goals
@@ -38,73 +38,49 @@ The target machine currently runs Hyprland 0.56.2. Live `hyprctl -j monitors all
 | Monitor | `DP-2` | `Philips Consumer Electronics Company / PHL 345E2 / UK02226037640` | 3440×1440 @ 74.983 Hz, 8-bit |
 | TV | `HDMI-A-1` | `Philips Consumer Electronics Company / Philips UHDTV / 0x01010101` | 3840×2160 @ 60 Hz, 8-bit, SDR, VRR off |
 
-The TV's live mode list did not advertise 3840×2160@144 at that moment. This is an operational precondition, not a fallback decision: TV mode must fail closed until the TV input is set to **Optimal (Auto Game)** and Hyprland advertises a `3840x2160@144...` mode. The implementation must never silently select the advertised `1920x1080@144` mode or downgrade to 4K120.
+The TV's live mode list did not advertise 3840×2160@144 at that moment. A disabled display omits its active mode from `availableModes`, so preflight accepts each display's own default resolution and refresh even when unadvertised, and `caps` merges that default into `modes`. Every non-default request must still be advertised (or be a custom monitor modeline); the applier never silently substitutes another mode or downgrades to 4K120.
 
-## Profiles
+## Settings Model
 
-### Monitor profile
+Each display has one settings set: `res`, `hz`, `vrr`, `hdr`, `scale`. Position is always `0x0`, and the other display is disabled.
 
-| Field | Required value |
-|---|---|
-| Identity | Exact make/model/serial match for the PHL 345E2 |
-| Mode | `3440x1440@74.98` |
-| Position | `0x0` |
-| Scale | `1` |
-| Bit depth | `8` |
-| Color preset | `srgb` |
-| SDR EOTF | `srgb` |
-| SDR saturation | `1.2` |
-| VRR | `0` |
-| Global HDR preference | off |
-
-The TV is disabled in the final monitor profile.
-
-### CS2 profiles
-
-`cs2` and `cs2-2k` keep the monitor's color treatment (`bitdepth 8`, `cm srgb`, `sdr_eotf srgb`, `sdrsaturation 1.2`, VRR off) and swap only the mode for a custom modeline that the GPU pillarboxes at Full aspect. Both require a patched Aquamarine that accepts explicit modelines.
-
-| Mode | Modeline | Purpose |
+| Display | Identity | Defaults |
 |---|---|---|
-| `cs2` | custom `1920x1080@~75` | Competitive resolution with GPU Full-aspect pillarbox |
-| `cs2-2k` | custom `2560x1440@~75` | Sharper CS2 resolution on the same path |
+| `monitor` | Exact make/model/serial match for the PHL 345E2 | `res=3440x1440 hz=74.98 vrr=0 hdr=0 scale=1` |
+| `tv` | HDMI connector plus exact Philips UHDTV make/model match; ignore dummy serial `0x01010101` | `res=3840x2160 hz=144 vrr=1 hdr=1 scale=1.5` |
 
-### TV profile
+### Composition
 
-| Field | Required value |
+`mode` comes from `res`+`hz`; `position`, `scale`, and `vrr` come from the request. Color fields follow the display and its `hdr` value:
+
+| Base | Fields |
 |---|---|
-| Identity | HDMI connector plus exact Philips UHDTV make/model match; ignore dummy serial `0x01010101` |
-| Mode | `3840x2160@144` exactly; no fallback |
-| Position | `0x0` |
-| Scale | `1.5` |
-| Bit depth | `10` |
-| Color preset | `hdr` |
-| SDR brightness | `3.0` |
-| SDR saturation | `1.0` |
-| SDR minimum luminance | `0` |
-| SDR maximum luminance | `200` |
-| Minimum luminance | `0` |
-| Maximum luminance | `1400` |
-| Maximum average luminance | `250` |
-| Force HDR support | `1` |
-| Force wide-color support | `1` |
-| VRR | `1` (enabled continuously on this output) |
-| Global HDR preference | on |
+| monitor, `hdr=0` | `bitdepth=8 cm=srgb sdr_eotf=srgb sdrsaturation=1.2` |
+| tv, `hdr=1` | `bitdepth=10 cm=hdr sdrbrightness=3.0 sdrsaturation=1.0 sdr_min_luminance=0 sdr_max_luminance=200 min_luminance=0 max_luminance=1400 max_avg_luminance=250 supports_hdr=1 supports_wide_color=1` |
+| tv, `hdr=0` | `bitdepth=10 cm=srgb sdr_eotf=srgb sdrsaturation=1.0` |
 
-The desktop monitor is disabled in the final TV profile.
+Globals: `misc:vrr = vrr`, `quirks:prefer_hdr = hdr`. `hdr=1` is refused for the monitor, which has no HDR composition.
 
-`tv-alt` is `tv` with VRR off (`vrr = 0`, `misc:vrr = 0`) and every other field identical.
+### Custom monitor modes
 
-The color and scale values above preserve the last intentional project tuning. Changing those values is a separate calibration decision, not part of the HDMI transport refactor.
+The monitor offers two modelines beyond its EDID list, both requiring the patched Aquamarine and GPU Full-aspect pillarbox. They are selected with `res=` + `hz=` and no extra key:
 
-SDR brightness is calibrated at `3.0` (Hyprland default `1.0`; `1.0 → 2.0 → 2.5 → 3.0` over the 2026-10-02 desktop-brightness tuning, with `5.0` tried and rejected as blown out): it lifts SDR white in HDR mode, which is this panel's only desktop-brightness lever (no backlight sysfs node, and the Philips UHDTV does not answer DDC/CI at `0x37`, so neither `brightnessctl` nor `ddcutil` can drive the panel) and, as a side effect, pushes VRR flicker on dark desktop content below the panel's visible gamma-wobble region. `3.0` puts SDR reference white at 600 cd/m² (`3.0 × sdr_max_luminance=200`); above that SDR highlights visibly clip, so treat `3.0` as the practical ceiling for this profile and change it in ≤`0.25` steps. Source audit of Hyprland 0.56.2: `CMonitorRuleParser::parseSDRBrightness` accepts any float — no range check, no clamp — and the only consumers are the color-management shader's `sdrBrightnessMultiplier` multiply and the SDR→HDR modifier gate, so this value alone cannot abort the compositor. The 2026-05-03 SIGABRT previously attributed to `2.0` was applied together with `cm = hdredid` plus explicit luminance overrides, both dropped later that evening; the current TV profile is `cm = hdr` with EDID-controlled luminance. `TV_ALT_PROFILE` must carry the same value so `tv` and `tv-alt` differ only in VRR.
+| Mode | Modeline |
+|---|---|
+| `1920x1080@74.65` | `modeline 220.75 1920 2056 2264 2608 1080 1083 1088 1130 -hsync +vsync` |
+| `2560x1440@74.89` | `modeline 397.25 2560 2760 3040 3520 1440 1443 1448 1506 -hsync +vsync` |
+
+The default color, scale, and SDR-brightness values preserve the last intentional project tuning. Changing them is a separate calibration decision, not part of the HDMI transport refactor.
+
+SDR brightness is calibrated at `3.0` (Hyprland default `1.0`; `1.0 → 2.0 → 2.5 → 3.0` over the 2026-10-02 desktop-brightness tuning, with `5.0` tried and rejected as blown out): it lifts SDR white in HDR mode, which is this panel's only desktop-brightness lever (no backlight sysfs node, and the Philips UHDTV does not answer DDC/CI at `0x37`, so neither `brightnessctl` nor `ddcutil` can drive the panel) and, as a side effect, pushes VRR flicker on dark desktop content below the panel's visible gamma-wobble region. `3.0` puts SDR reference white at 600 cd/m² (`3.0 × sdr_max_luminance=200`); above that SDR highlights visibly clip, so treat `3.0` as the practical ceiling for this profile and change it in ≤`0.25` steps. Source audit of Hyprland 0.56.2: `CMonitorRuleParser::parseSDRBrightness` accepts any float — no range check, no clamp — and the only consumers are the color-management shader's `sdrBrightnessMultiplier` multiply and the SDR→HDR modifier gate, so this value alone cannot abort the compositor. The 2026-05-03 SIGABRT previously attributed to `2.0` was applied together with `cm = hdredid` plus explicit luminance overrides, both dropped later that evening; the current TV HDR base is `cm = hdr` with EDID-controlled luminance. `TV_HDR_COLOR` carries this value; the `tv` SDR base uses `cm = srgb` without it.
 
 ## Component Boundaries
 
 ```mermaid
 flowchart LR
     K[Super+O keybind] --> U[display_switcher.py]
-    U -->|status, connected| A[display_apply.sh]
-    U -->|monitor, cs2, tv, tv-alt| A
+    U -->|caps| A[display_apply.sh]
+    U -->|monitor/tv + key=value| A
     W[display_watch.py] -->|ensure| A
     W -->|socket2 monitoradded / monitorremoved| H
     A -->|single JSON snapshot| H[hyprctl IPC]
@@ -117,19 +93,16 @@ flowchart LR
 
 ### `src/display_switcher.py`: presentation only
 
-Terminal-style panel in IBM Plex Mono (installed user-level in `~/.local/share/fonts`; fallbacks JetBrainsMono Nerd Font, then DejaVu Sans Mono) on a warm dark background with a single cyan accent.
+Cold blue-black terminal panel (job-agent), Martian Mono (installed user-level in `~/.local/share/fonts/MartianMono`), tracked uppercase chrome, italic hints.
 
 Responsibilities:
 
-- Header `Display switcher` plus `active: <Group> · <mode>`, and a `$ display-apply.sh <selected mode id>` prompt with a blinking cursor.
-- Group modes by display under uppercase headings with device and connector, and a group-level `not connected` marker:
-  - `MONITOR` (PHL 345E2 · DP): Desktop (`monitor`), CS2 (`cs2`).
-  - `TV` (Philips UHDTV · HDMI): HDR · VRR (`tv`), HDR, VRR off (`tv-alt`).
-- Number the rows 1–4 for the digit keys, tag the active row `● active`, and dim and skip every row of a disconnected display.
-- Footer: `↑↓ move · 1–4 jump · enter apply · esc cancel`, plus a 3 s auto-close countdown that resets on input.
-- Ask the applier for `status` and `connected`; do not parse monitor topology independently.
-- Launch the applier detached; on failure send a `notify-send` notification titled `<Group> · <mode> failed` with the applier's last error line.
-- Keep `cs2-2k` applier-only, with no row.
+- Displays are the top level: one 1px frame per display (`MONITOR`, `TV`) whose legend carries role, device and transport, an inverse `ACTIVE` tag, and `SDR` when the display cannot do HDR; a disconnected frame reads `not connected`.
+- Inside each frame: `RESOLUTION`, `REFRESH`, `VRR`, `HDR`, `SCALE` rows built from `caps`; VRR and HDR appear only when the display is capable.
+- Prompt shows the exact command, e.g. `$ display-apply.sh tv hz=120`, with a blinking cursor and only the keys that differ from the display's defaults.
+- Initial values per display: remembered (if still valid against `caps`) → `current` → `defaults`, with remembered settings stored in `~/.local/state/display-switcher-settings.json`.
+- Keys: `↑`/`↓` or `j`/`k` select, `←`/`→` or `h`/`l` change, `space` toggles, `Tab` or `Super+O` cycles displays, `1`/`2` apply that display, `Enter` applies the focused row's display, `Esc` closes. The footer shows the hints plus a 5 s auto-close countdown that resets on input.
+- Launch the applier detached; on failure send a `notify-send` notification titled `<Display> failed` with the applier's last error line.
 - Retain the existing single-instance/PID behavior.
 
 The adapter-era eight-second cooldown is removed. Concurrency belongs to the applier lock; the overlay only prevents duplicate windows.
@@ -139,9 +112,9 @@ The adapter-era eight-second cooldown is removed. Concurrency belongs to the app
 Responsibilities:
 
 - Own display discovery, state detection, preflight, config generation, application, workspace migration, verification, locking, and concise logging.
-- Accept `status`, `connected`, `ensure`, and the five apply modes `monitor`, `cs2`, `cs2-2k`, `tv`, `tv-alt`.
+- Accept `status`, `caps`, `ensure`, and `monitor` / `tv` with optional `res=`, `hz=`, `vrr=`, `hdr=`, `scale=` keys.
 - Read structured monitor data with `hyprctl -j monitors all` and `jq`; never scrape human-readable output.
-- Emit only the status token on stdout for `status`, and only role names for `connected`. Diagnostics go to stderr and the log.
+- Emit only the status token for `status`, only the capabilities JSON for `caps`, and one success line for an apply. Diagnostics go to stderr and the log.
 - Write a single hyprlang `monitorv2` generated file because the deployed HyDE configuration currently sources `display-switcher-generated.conf` after `monitors.conf`.
 - Never call sudo or modify kernel, DRM debugfs, sysfs power levels, audio state, notification daemons, wallpaper daemons, or TV settings.
 
@@ -149,40 +122,43 @@ CLI contract:
 
 | Invocation | stdout | Exit |
 |---|---|---|
-| `display_apply.sh status` | `monitor`, `cs2`, `cs2-2k`, `tv`, `tv-alt`, or `unknown` | 0 when discovery succeeded |
-| `display_apply.sh connected` | connected roles, one per line in `monitor`, `tv` order | 0; empty stdout when none is connected |
-| `display_apply.sh ensure` | concise success or no-op line | 0; no-op while any known display is enabled, else applies `monitor` if connected, else `tv` |
-| `display_apply.sh monitor` | concise success line | 0 only after final verification |
-| `display_apply.sh cs2` | concise success line | 0 only after final verification |
-| `display_apply.sh cs2-2k` | concise success line | 0 only after final verification |
-| `display_apply.sh tv` | concise success line | 0 only after final verification |
-| `display_apply.sh tv-alt` | concise success line | 0 only after final verification |
+| `display_apply.sh status` | `monitor`, `tv`, or `unknown` | 0; 3 on discovery failure |
+| `display_apply.sh caps` | one JSON object describing both displays | 0; 3 on discovery failure or ambiguity |
+| `display_apply.sh ensure` | concise success or no-op line | 0; no-op while any known display is enabled, else applies `monitor` then `tv` defaults |
+| `display_apply.sh monitor [key=value ...]` | concise success line | 0 only after final verification |
+| `display_apply.sh tv [key=value ...]` | concise success line | 0 only after final verification |
 | Invalid/missing command | usage | 2 |
 | Discovery or preflight failure | diagnostic | 3; topology unchanged |
 | Apply or verification failure | diagnostic | 4 |
 | Another apply is running | diagnostic | 5 |
 
-Mode → role: `monitor`, `cs2`, and `cs2-2k` require the `monitor` role; `tv` and `tv-alt` require the `tv` role.
+Apply keys are `res=WxH`, `hz=N`, `vrr=0|1`, `hdr=0|1`, `scale=S`; omitted keys take the display's defaults, and unknown, duplicated, or malformed keys exit 2.
+
+Preflight (exit 3, before any write or reload): the target is connected and uniquely identified; `res`+`hz` is an advertised mode within 0.1 Hz, a custom monitor modeline, or that display's own default; `vrr=1` requires `vrr_capable`; `hdr=1` requires `hdr_capable` and is refused for the monitor; `scale` ∈ {1, 1.25, 1.5, 2}.
+
+The default resolution and refresh are accepted even when the display does not advertise them (a disabled TV drops 4K144 from `availableModes`), and `caps` merges that default into `modes`. The `vrr`/`hdr` capability gates apply only when the request differs from the display default, so optional probes never block defaults or failover.
+
+`caps` returns one object: `active` plus both displays in order, each with `device`, `connector`, `transport`, `connected`, `enabled`, `vrr_capable`, `hdr_capable`, `modes` (resolution plus rates, custom modelines merged), `scales`, `defaults`, and `current`. A disconnected display reports null connector/transport and `current`, empty `modes`, and false capabilities; `hdr_capable` and `vrr_capable` come from read-only probes (`di-edid-decode`, `modetest`) and degrade to false when a tool is missing.
 
 ### `src/display_watch.py`: failover watcher
 
 Responsibilities:
 
-- Run from Hyprland `exec-once` after the startup reload; also run once at startup so a saved mode whose display is gone recovers.
+- Run from Hyprland `exec-once` after the startup reload; also run once at startup so saved settings whose display is gone recover.
 - Listen on Hyprland socket2 for `monitoradded` and `monitorremoved`, debounce 3 s, then run `display_apply.sh ensure`.
 - Retry after 2 s when the applier lock is held (exit 5).
 - Never switch away from a working display: `ensure` is a no-op while any known display is enabled.
 
 ### Generated configuration: persistent desired state
 
-`~/.config/hypr/display-switcher-generated.conf` contains the complete desired state for both known displays and the mode-specific global HDR preference. It is generated through a temporary file in the same directory and an atomic rename. Partial files must never be visible to Hyprland.
+`~/.config/hypr/display-switcher-generated.conf` contains the complete desired state for both displays and the request's global VRR/HDR preferences. It is generated through a temporary file in the same directory and an atomic rename. Partial files must never be visible to Hyprland.
 
 Use the full EDID description in persistent rules so connector renumbering does not invalidate the next reload and the Monitor selector retains its serial. These are verbatim live Hyprland 0.56.2 `description` values, not strings assembled from separate JSON fields:
 
 - `desc:Philips Consumer Electronics Company PHL 345E2 UK02226037640`
 - `desc:Philips Consumer Electronics Company Philips UHDTV 0x01010101`
 
-Hyprland selectors match either a connector name or a description prefix; they cannot conjunct EDID identity with `HDMI-A-*`. Runtime discovery therefore enforces the HDMI transport before every TV mutation, while the persistent rule uses the full EDID description for replug stability. The supported physical contract requires the TV to remain on native HDMI. Before intentionally changing its transport, apply Monitor mode so the persisted TV rule is disabled; a later TV request on a DP adapter must fail preflight.
+Hyprland selectors match either a connector name or a description prefix; they cannot conjunct EDID identity with `HDMI-A-*`. Runtime discovery therefore enforces the HDMI transport before every TV mutation, while the persistent rule uses the full EDID description for replug stability. The supported physical contract requires the TV to remain on native HDMI. Before intentionally changing its transport, apply the monitor display so the persisted TV rule is disabled; a later `tv` request on a DP adapter must fail preflight.
 
 Runtime IPC, workspace migration, and verification use connector names from the current JSON snapshot.
 
@@ -204,23 +180,23 @@ One JSON snapshot is the source for a decision. Re-query only while polling afte
 1. Match the monitor by exact `make`, `model`, and `serial`.
 2. Match the TV by connector name matching `^HDMI-A-`, exact `make`, and exact `model`. Do not use the dummy TV serial as identity.
 3. Reject duplicate or ambiguous matches for either role and require matched roles to use different connectors.
-4. Require exactly one match for the requested target. The non-target role may be absent; a disconnected TV must never block recovery into Monitor mode.
-5. Before TV mode, require an advertised mode whose parsed resolution is 3840×2160 and refresh is within 0.1 Hz of 144.
-6. Reject a missing, disconnected, or incapable target before writing a file or invoking reload.
+4. Require exactly one match for the requested target. The non-target role may be absent; a disconnected TV must never block recovery into the monitor display.
+5. Accept `res`+`hz` when it is an advertised mode within 0.1 Hz, a custom monitor modeline, or the target display's own default resolution and refresh.
+6. Reject a missing, disconnected, or incapable target — including unsupported VRR/HDR that differs from the display default, and a scale outside {1, 1.25, 1.5, 2} — before writing a file or invoking reload.
 
-Connector names are outputs of discovery, never configuration constants. `cs2` and `cs2-2k` need no advertised mode: they install a custom modeline through the patched Aquamarine, so preflight only requires the monitor role and HDMI preflight applies to the TV role alone.
+Connector names are outputs of discovery, never configuration constants. Custom monitor modelines install through the patched Aquamarine, so they never depend on the EDID mode list.
 
 ## State Model
 
 | Monitor role enabled | TV role enabled | Status |
 |---|---|---|
-| yes | no or absent | `monitor`, `cs2`, or `cs2-2k`, whichever monitor-side profile is active |
-| no or absent | yes | `tv`, or `tv-alt` when the TV profile runs with VRR off |
+| yes | no or absent | `monitor` |
+| no or absent | yes | `tv` |
 | yes | yes | `unknown` |
 | no or absent | no or absent | `unknown` |
 | ambiguous role identity | any | discovery error |
 
-`unknown` is a real state, not an alias for monitor mode. It lets the UI recover from manual changes without lying about the current topology.
+`unknown` is a real state, not an alias for the monitor display. It lets the UI recover from manual changes without lying about the current topology.
 
 ## Safe Transition Transaction
 
@@ -233,14 +209,14 @@ sequenceDiagram
     participant H as Hyprland
     participant F as Generated config
 
-    UI->>A: apply mode
+    UI->>A: apply request
     A->>A: acquire lock
     A->>H: monitors all (JSON)
-    A->>A: discover roles + validate exact target profile
+    A->>A: discover roles + validate request
     A->>F: snapshot previous file + live HDR preference
     A->>F: atomically write staging config (target active first; keep any active source)
     A->>H: reload
-    A->>H: poll until target profile is active
+    A->>H: poll until the requested settings are active
     A->>H: migrate workspaces from any active source → target
     A->>F: atomically write final config (target active; non-target disabled by description)
     A->>H: reload
@@ -251,48 +227,26 @@ sequenceDiagram
 Rules:
 
 1. Validate everything possible before mutation.
-2. The staging config enables the target with its final profile while keeping any connected, active source at a non-overlapping `auto-right` position. If no source is connected, the verified target itself satisfies the invariant.
+2. The staging config enables the target with its resolved settings while keeping any connected, active source at a non-overlapping `auto-right` position. If no source is connected, the verified target itself satisfies the invariant.
 3. Replace arbitrary sleeps with bounded polling: poll structured state every 100 ms for up to five seconds, or fifteen when nothing was active before the switch (a target waking from a dark session can report 0×0 for several seconds).
 4. Migrate active workspaces only after the target is verified active and before disabling a connected source.
 5. The final config lists the active target rule before the disabled non-target rule.
 6. On failure, restore the previous generated file atomically **without reloading it**, then restore the snapshotted live `quirks:prefer_hdr` value through IPC. This preserves the previous persistent and global HDR state while avoiding another risky monitor transition. Leave the live compositor with whichever one-or-two-display state still has an active output; exit nonzero with observed state. Rollback never restores a config with no active output.
-7. Reapplying the current mode is idempotent and still performs final verification.
+7. Reapplying the same settings is idempotent and still performs final verification.
 
 No retry reset loop is allowed. A second blind topology transition can hide the first failure and was needed only for the adapter.
 
 ## Verification Contract
 
-### Monitor mode
+### Per apply
 
 Final JSON must show:
 
-- Monitor enabled, TV disabled.
-- Monitor width 3440, height 1440, refresh within 0.1 Hz of 74.98, scale 1.
-- Monitor color preset is `srgb`; VRR is false. `currentFormat` is asserted only for 10-bit profiles, so the 8-bit profile adds no format check.
-- `quirks:prefer_hdr` is false.
-
-### cs2 / cs2-2k modes
-
-Final JSON must show:
-
-- Monitor enabled, TV disabled.
-- Monitor at the custom 1920×1080 (`cs2`) or 2560×1440 (`cs2-2k`) mode, its ~75 Hz modeline refresh, scale 1.
-- Monitor color preset is `srgb`; VRR is false; the 8-bit profile adds no `currentFormat` check.
-- `quirks:prefer_hdr` is false.
-
-### TV mode
-
-Final JSON must show:
-
-- TV enabled, monitor disabled.
-- TV connector is still HDMI.
-- TV width 3840, height 2160, refresh within 0.1 Hz of 144, scale 1.5.
-- TV `currentFormat` is a 10-bit format.
-- TV color preset is `hdr`.
-- TV VRR is true.
-- `quirks:prefer_hdr` is true.
-
-For `tv-alt`, VRR must be false (`vrr` false, `misc:vrr` 0); every other field is as above.
+- The requested display enabled and the other display disabled, with the TV still on an `HDMI-A-*` connector.
+- The requested width and height, with refresh within 0.1 Hz of the request (custom monitor modelines included).
+- The requested scale, `vrr`, and the color preset of the composed base (`srgb` for SDR, `hdr` for TV HDR).
+- A 10-bit `currentFormat` when the composed base is 10-bit (the TV in both HDR and SDR).
+- Globals `misc:vrr` equal to the requested `vrr` and `quirks:prefer_hdr` equal to the requested `hdr`.
 
 The compositor state is the acceptance source. Log output, generated text, command exit status, and the TV on-screen information panel are supporting evidence, not substitutes.
 
@@ -301,13 +255,14 @@ The compositor state is the acceptance source. Log output, generated text, comma
 | Failure | Required behavior |
 |---|---|
 | Requested target disconnected or not uniquely identified | Exit 3; no mutation |
-| 4K144 absent from advertised modes | Exit 3; no mutation and no fallback |
+| Requested `res`+`hz` not advertised, not a custom modeline, and not the display default | Exit 3; no mutation and no substitution |
+| Requested `vrr=1`/`hdr=1` when the display is not capable and the request differs from its default | Exit 3; no mutation |
 | `jq`/`hyprctl` unavailable or invalid JSON | Exit 3; no mutation |
 | Staging target fails verification | Restore previous generated file and live HDR preference; leave source active; exit 4 |
-| Final state fails verification | Restore previous generated file without monitor reload, restore live HDR preference through IPC, report all observed profile fields; exit 4 |
+| Final state fails verification | Restore previous generated file without monitor reload, restore live HDR preference through IPC, report all observed fields; exit 4 |
 | Concurrent apply | Exit 5 immediately |
 | `ensure` with no known display connected | Exit 3; nothing to enable |
-| UI status returns `unknown` | Show neither mode as current; allow explicit recovery selection |
+| `status` reports `unknown` | Header shows no active display; defaults remain selectable |
 
 ## Repository Cutover
 
@@ -348,8 +303,8 @@ The switcher must not attempt privileged bootloader or sudoers edits.
 
 | Decision | Reason |
 |---|---|
-| Five modes over two display roles | Monitor-side CS2 modes use custom modelines and `tv-alt` is an explicit VRR-off TV choice; still no Mirror or Extend state |
-| Exact TV mode, fail closed | A fallback could silently violate resolution, refresh, bit-depth, HDR, or VRR requirements |
+| Two displays with per-apply settings, not fixed modes | One code path builds mode, color, VRR, and globals from the request; fixed mode names and aliases were removed |
+| Fail closed on unavailable requests | A silent substitution would violate the requested resolution, refresh, bit-depth, HDR, or VRR |
 | EDID identity plus runtime connector class | Full EDID selectors survive connector renumbering; runtime preflight rejects a TV not currently connected through native HDMI |
 | One applier owns status and mutation | Prevents Python and Bash topology parsers from diverging |
 | Structured JSON only | Human-readable `hyprctl` output already caused brittle detection |
