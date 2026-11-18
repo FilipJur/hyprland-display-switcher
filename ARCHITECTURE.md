@@ -40,9 +40,13 @@ The target machine currently runs Hyprland 0.56.2. Live `hyprctl -j monitors all
 
 The TV's live mode list did not advertise 3840×2160@144 at that moment. A disabled display omits its active mode from `availableModes`, so preflight accepts each display's own default resolution and refresh even when unadvertised, and `caps` merges that default into `modes`. Every non-default request must still be advertised (or be a custom monitor modeline); the applier never silently substitutes another mode or downgrades to 4K120.
 
+Live-verified on 2026-11-18 against real hardware and the DRM readout: TV VRR on/off as a VRR-only change, HDR on/off, `3840x2160@120`, scale 1, and `2560x1440@120` at scale 1.6; monitor VRR on/off as a VRR-only change, scale 1.25 and 1.6, and the custom `1920x1080@74.65` / `2560x1440@74.89` modelines.
+
 ## Settings Model
 
 Each display has one settings set: `res`, `hz`, `vrr`, `hdr`, `scale`. Position is always `0x0`, and the other display is disabled.
+
+Scale candidates are `1`, `1.25`, `1.5`, `1.6`, `1.75`, `2`. Hyprland requires an integral logical size (`W/scale` and `H/scale` integers) and otherwise rounds the scale and shows an error overlay, so `caps` reports the scales valid at each resolution and the overlay offers only those.
 
 | Display | Identity | Defaults |
 |---|---|---|
@@ -51,7 +55,7 @@ Each display has one settings set: `res`, `hz`, `vrr`, `hdr`, `scale`. Position 
 
 ### Composition
 
-`mode` comes from `res`+`hz`; `position`, `scale`, and `vrr` come from the request. Color fields follow the display and its `hdr` value:
+`mode` comes from `res`+`hz`; `position` and `scale` come from the request. Color fields follow the display and its `hdr` value:
 
 | Base | Fields |
 |---|---|
@@ -60,6 +64,12 @@ Each display has one settings set: `res`, `hz`, `vrr`, `hdr`, `scale`. Position 
 | tv, `hdr=0` | `bitdepth=10 cm=srgb sdr_eotf=srgb sdrsaturation=1.0` |
 
 Globals: `misc:vrr = vrr`, `quirks:prefer_hdr = hdr`. `hdr=1` is refused for the monitor, which has no HDR composition.
+
+### VRR is global only
+
+Generated `monitorv2` blocks carry no `vrr`: the request's value is written once as `misc:vrr` and reasserted through IPC after each reload. Hyprland 0.56.2's `CMonitorRule::compare()` ignores `m_vrr`, so a VRR-only change compares as a full match, the per-monitor rule is not re-applied, and a stale per-monitor value would override `misc:vrr` in `ensureVRR()`. With exactly one display active, the global is the per-display VRR control.
+
+Caveat: a session whose active rule still carries a per-monitor `vrr` from an older generated file keeps that value until the rule is re-applied — a display switch, a mode or scale change, or a Hyprland restart.
 
 ### Custom monitor modes
 
@@ -98,7 +108,7 @@ Cold blue-black terminal panel (job-agent), Martian Mono (installed user-level i
 Responsibilities:
 
 - Displays are the top level: one 1px frame per display (`MONITOR`, `TV`) whose legend carries role, device and transport, an inverse `ACTIVE` tag, and `SDR` when the display cannot do HDR; a disconnected frame reads `not connected`.
-- Inside each frame: `RESOLUTION`, `REFRESH`, `VRR`, `HDR`, `SCALE` rows built from `caps`; VRR and HDR appear only when the display is capable.
+- Inside each frame: `RESOLUTION`, `REFRESH`, `VRR`, `HDR`, `SCALE` rows built from `caps`; VRR and HDR appear only when the display is capable, `SCALE` offers only the selected mode's valid scales, and a resolution change snaps the scale to the nearest valid one.
 - Prompt shows the exact command, e.g. `$ display-apply.sh tv hz=120`, with a blinking cursor and only the keys that differ from the display's defaults.
 - Initial values per display: remembered (if still valid against `caps`) → `current` → `defaults`, with remembered settings stored in `~/.local/state/display-switcher-settings.json`.
 - Keys: `↑`/`↓` or `j`/`k` select, `←`/`→` or `h`/`l` change, `space` toggles, `Tab` or `Super+O` cycles displays, `1`/`2` apply that display, `Enter` applies the focused row's display, `Esc` closes. The footer shows the hints plus a 5 s auto-close countdown that resets on input.
@@ -134,11 +144,11 @@ CLI contract:
 
 Apply keys are `res=WxH`, `hz=N`, `vrr=0|1`, `hdr=0|1`, `scale=S`; omitted keys take the display's defaults, and unknown, duplicated, or malformed keys exit 2.
 
-Preflight (exit 3, before any write or reload): the target is connected and uniquely identified; `res`+`hz` is an advertised mode within 0.1 Hz, a custom monitor modeline, or that display's own default; `vrr=1` requires `vrr_capable`; `hdr=1` requires `hdr_capable` and is refused for the monitor; `scale` ∈ {1, 1.25, 1.5, 2}.
+Preflight (exit 3, before any write or reload): the target is connected and uniquely identified; `res`+`hz` is an advertised mode within 0.1 Hz, a custom monitor modeline, or that display's own default; `vrr=1` requires `vrr_capable`; `hdr=1` requires `hdr_capable` and is refused for the monitor; `scale` is one of 1, 1.25, 1.5, 1.6, 1.75, 2 and must give an integral logical size at the requested resolution, otherwise exit 3 with `scale S gives a fractional logical size at WxH`.
 
 The default resolution and refresh are accepted even when the display does not advertise them (a disabled TV drops 4K144 from `availableModes`), and `caps` merges that default into `modes`. The `vrr`/`hdr` capability gates apply only when the request differs from the display default, so optional probes never block defaults or failover.
 
-`caps` returns one object: `active` plus both displays in order, each with `device`, `connector`, `transport`, `connected`, `enabled`, `vrr_capable`, `hdr_capable`, `modes` (resolution plus rates, custom modelines merged), `scales`, `defaults`, and `current`. A disconnected display reports null connector/transport and `current`, empty `modes`, and false capabilities; `hdr_capable` and `vrr_capable` come from read-only probes (`di-edid-decode`, `modetest`) and degrade to false when a tool is missing.
+`caps` returns one object: `active` plus both displays in order, each with `device`, `connector`, `transport`, `connected`, `enabled`, `vrr_capable`, `hdr_capable`, `modes` (resolution plus rates, custom modelines merged, and the `scales` valid at that resolution), `defaults`, and `current`. A disconnected display reports null connector/transport and `current`, empty `modes`, and false capabilities; `hdr_capable` and `vrr_capable` come from read-only probes (`di-edid-decode`, `modetest`) and degrade to false when a tool is missing.
 
 ### `src/display_watch.py`: failover watcher
 
@@ -151,7 +161,7 @@ Responsibilities:
 
 ### Generated configuration: persistent desired state
 
-`~/.config/hypr/display-switcher-generated.conf` contains the complete desired state for both displays and the request's global VRR/HDR preferences. It is generated through a temporary file in the same directory and an atomic rename. Partial files must never be visible to Hyprland.
+`~/.config/hypr/display-switcher-generated.conf` contains the complete desired state for both displays and the request's global VRR/HDR preferences. Blocks carry mode, position, scale, and color fields, but no per-monitor `vrr` (see VRR is global only). It is generated through a temporary file in the same directory and an atomic rename. Partial files must never be visible to Hyprland.
 
 Use the full EDID description in persistent rules so connector renumbering does not invalidate the next reload and the Monitor selector retains its serial. These are verbatim live Hyprland 0.56.2 `description` values, not strings assembled from separate JSON fields:
 
@@ -182,7 +192,7 @@ One JSON snapshot is the source for a decision. Re-query only while polling afte
 3. Reject duplicate or ambiguous matches for either role and require matched roles to use different connectors.
 4. Require exactly one match for the requested target. The non-target role may be absent; a disconnected TV must never block recovery into the monitor display.
 5. Accept `res`+`hz` when it is an advertised mode within 0.1 Hz, a custom monitor modeline, or the target display's own default resolution and refresh.
-6. Reject a missing, disconnected, or incapable target — including unsupported VRR/HDR that differs from the display default, and a scale outside {1, 1.25, 1.5, 2} — before writing a file or invoking reload.
+6. Reject a missing, disconnected, or incapable target — including unsupported VRR/HDR that differs from the display default, an unsupported scale, or a scale that makes the logical size fractional at the requested resolution — before writing a file or invoking reload.
 
 Connector names are outputs of discovery, never configuration constants. Custom monitor modelines install through the patched Aquamarine, so they never depend on the EDID mode list.
 
@@ -231,7 +241,7 @@ Rules:
 3. Replace arbitrary sleeps with bounded polling: poll structured state every 100 ms for up to five seconds, or fifteen when nothing was active before the switch (a target waking from a dark session can report 0×0 for several seconds).
 4. Migrate active workspaces only after the target is verified active and before disabling a connected source.
 5. The final config lists the active target rule before the disabled non-target rule.
-6. On failure, restore the previous generated file atomically **without reloading it**, then restore the snapshotted live `quirks:prefer_hdr` value through IPC. This preserves the previous persistent and global HDR state while avoiding another risky monitor transition. Leave the live compositor with whichever one-or-two-display state still has an active output; exit nonzero with observed state. Rollback never restores a config with no active output.
+6. On failure, restore the previous generated file atomically **without reloading it**, then restore the snapshotted live `misc:vrr` and `quirks:prefer_hdr` values through IPC. This preserves the previous persistent and global VRR/HDR state while avoiding another risky monitor transition. Leave the live compositor with whichever one-or-two-display state still has an active output; exit nonzero with observed state. Rollback never restores a config with no active output.
 7. Reapplying the same settings is idempotent and still performs final verification.
 
 No retry reset loop is allowed. A second blind topology transition can hide the first failure and was needed only for the adapter.
@@ -250,6 +260,17 @@ Final JSON must show:
 
 The compositor state is the acceptance source. Log output, generated text, command exit status, and the TV on-screen information panel are supporting evidence, not substitutes.
 
+### DRM ground truth
+
+The final poll also reads the kernel's DRM state through read-only `modetest -c/-e/-p`:
+
+- CRTC mode width/height and refresh within 0.1 Hz of the request, including user-defined modelines named like `1920x1080@74`.
+- `VRR_ENABLED` equal to the requested `vrr`.
+- Connector `Colorspace` = 9 (`BT2020_RGB`) for `hdr=1`, 0 (`Default`) for `hdr=0`.
+- `HDR_OUTPUT_METADATA` EOTF 0x02 for `hdr=1`; empty or 0 for `hdr=0`.
+
+A missing or unparseable `modetest` skips the DRM check with a single log line and never blocks an apply. On failure the observed-state report adds a `DRM` line, or `DRM unavailable: <reason>`.
+
 ## Failure Semantics
 
 | Failure | Required behavior |
@@ -258,8 +279,8 @@ The compositor state is the acceptance source. Log output, generated text, comma
 | Requested `res`+`hz` not advertised, not a custom modeline, and not the display default | Exit 3; no mutation and no substitution |
 | Requested `vrr=1`/`hdr=1` when the display is not capable and the request differs from its default | Exit 3; no mutation |
 | `jq`/`hyprctl` unavailable or invalid JSON | Exit 3; no mutation |
-| Staging target fails verification | Restore previous generated file and live HDR preference; leave source active; exit 4 |
-| Final state fails verification | Restore previous generated file without monitor reload, restore live HDR preference through IPC, report all observed fields; exit 4 |
+| Staging target fails verification | Restore previous generated file and live VRR/HDR preferences; leave source active; exit 4 |
+| Final state fails verification | Restore previous generated file without monitor reload, restore live VRR/HDR preferences through IPC, report all observed fields plus the DRM line; exit 4 |
 | Concurrent apply | Exit 5 immediately |
 | `ensure` with no known display connected | Exit 3; nothing to enable |
 | `status` reports `unknown` | Header shows no active display; defaults remain selectable |
@@ -312,6 +333,11 @@ The switcher must not attempt privileged bootloader or sudoers edits.
 | Hyprlang only for this cutover | Matches the deployed HyDE source chain; removes dual-format branching |
 | No audio management | Outside the explicitly reduced display-only scope |
 | No adapter fallback code | Native HDMI removes the hardware and its failure model |
+
+## Known Limitations
+
+- A display whose active `monitorv2` rule still carries a per-monitor `vrr` from an older generated file keeps that value until the rule is re-applied: a display switch, a mode or scale change, or a Hyprland restart. Current generated files carry no per-monitor `vrr`.
+- DRM verification is skipped when `modetest` is missing or its output is unparseable; the Hyprland-level checks still apply.
 
 ## References
 

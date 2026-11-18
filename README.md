@@ -22,9 +22,11 @@ display's defaults.
 | **TV** | Philips 55OLED820 ("Philips UHDTV") | `3840x2160@144`, scale 1.5, 10-bit HDR (`cm = hdr`), VRR on, native HDMI 2.1 FRL12 |
 
 Settings are resolution, refresh, VRR on/off, HDR on/off, and scale ∈
-{1, 1.25, 1.5, 2}. The monitor also offers two custom modelines,
-`1920x1080@74.65` and `2560x1440@74.89`, with GPU Full-aspect pillarbox (needs
-the patched Aquamarine).
+{1, 1.25, 1.5, 1.6, 1.75, 2}; the scale must give an integral logical size at
+the chosen resolution, and `caps` reports the valid scales per resolution. The
+monitor also offers two custom modelines, `1920x1080@74.65` and
+`2560x1440@74.89`, with GPU Full-aspect pillarbox (needs the patched
+Aquamarine).
 
 Both displays are matched by their full EDID description selectors, so
 connector renumbering cannot invalidate the persistent rules:
@@ -46,8 +48,15 @@ desc:Philips Consumer Electronics Company Philips UHDTV 0x01010101
   reloads, migrates workspaces to the target, and polls `hyprctl -j monitors
   all` until the requested settings are active — resolution, refresh, scale,
   color preset, VRR, HDR preference, and the other display disabled (10-bit
-  output is asserted for the TV). Actual 10-bit output on the HDMI link can be
-  confirmed via the connector's `amdgpu_current_bpc` sysfs value.
+  output is asserted for the TV). The final poll also checks the kernel's DRM
+  state (`modetest -c/-e/-p`): CRTC mode and refresh, `VRR_ENABLED`,
+  `Colorspace`, and the HDR metadata EOTF. Actual 10-bit output on the HDMI
+  link can be confirmed via the connector's `amdgpu_current_bpc` sysfs value.
+- VRR is applied through the global `misc:vrr` only; generated display rules
+  carry no `vrr`, because Hyprland 0.56.2 treats a VRR-only rule change as a
+  full match and would keep a stale per-display value. A rule written by an
+  older version keeps its per-display `vrr` until the display's rule is
+  rewritten (display switch, mode/scale change, or restart).
 - Fail-closed: a non-default mode must be advertised (or be a custom monitor
   modeline), and unsupported VRR/HDR or scale exits nonzero before changing
   topology. Reapplying the same settings is idempotent.
@@ -99,9 +108,11 @@ Displays are the top level: a 1px frame per display whose legend carries the
 role, device and transport, an inverse `ACTIVE` tag, and `SDR` when the
 display cannot do HDR; a disconnected frame reads `not connected`. Inside each
 frame are `RESOLUTION`, `REFRESH`, `VRR`, `HDR`, and `SCALE` rows built from
-`caps` — VRR and HDR only when the display is capable — and the prompt shows
-the exact command with a blinking cursor, e.g. `$ display-apply.sh tv hz=120`
-(only keys that differ from the display's defaults).
+`caps` — VRR and HDR only when the display is capable, scales only where the
+logical size stays integral (changing resolution snaps the scale to the
+nearest valid one) — and the prompt shows the exact command with a blinking
+cursor, e.g. `$ display-apply.sh tv hz=120` (only keys that differ from the
+display's defaults).
 
 Initial values per display come from the remembered settings file
 (`~/.local/state/display-switcher-settings.json`), then the display's current

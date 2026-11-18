@@ -25,7 +25,7 @@ Two displays, each with an independent settings set: `res`, `hz`, `vrr`, `hdr`, 
 - **Monitor (`monitor`):** Philips PHL 345E2; defaults `3440x1440@74.98`, 8-bit SDR, VRR off, scale 1. Custom monitor modes `1920×1080@74.65` and `2560×1440@74.89` (GPU Full-aspect pillarbox, patched Aquamarine).
 - **TV (`tv`):** Philips 55OLED820/Philips UHDTV over native HDMI 2.1 FRL12; defaults `3840x2160@144`, 10-bit HDR (BT2020 RGB), VRR on, scale 1.5.
 
-Applying one display disables the other; omitted keys take that display's defaults.
+Applying one display disables the other; omitted keys take that display's defaults. Scale candidates are `1`, `1.25`, `1.5`, `1.6`, `1.75`, `2`, and the scale must give an integral logical size at the chosen resolution; `caps` reports the valid scales per resolution. VRR is global only (`misc:vrr`), because Hyprland 0.56.2's rule comparison ignores `vrr`.
 
 HDMI 2.1 FRL12 and VRR are proven on this hardware (see Tested Environment and Proven State); do not investigate or dispute them. A non-default request must be advertised, while each display's own default resolution and refresh is accepted even when unadvertised (a disabled TV omits 4K144 from `availableModes`). Omission never substitutes a different mode.
 
@@ -34,7 +34,7 @@ HDMI 2.1 FRL12 and VRR are proven on this hardware (see Tested Environment and P
 1. Identify display roles from structured EDID fields and connector class; connector names are runtime data, never role constants.
 2. Enable and verify the target before disabling the source. Never create a zero-monitor state.
 3. Accept only `status`, `caps`, `ensure`, and `monitor`/`tv` with optional `res`, `hz`, `vrr`, `hdr`, `scale` keys; nothing else.
-4. Verify effective JSON state after every mutation. A successful command exit is not proof.
+4. Verify effective JSON state after every mutation, and the DRM state via read-only `modetest` where available. A successful command exit is not proof.
 5. No automatic downgrade from 4K144, 10-bit, HDR, or VRR: explicit user settings are not automatic, and `ensure` applies defaults only when no known display is enabled.
 6. No sudo or privileged operations in project code.
 7. No audio routing, Extend, Mirror, PCON/DPCD, DPM, adapter reset, daemon-kill, or Lua-generation compatibility path.
@@ -46,8 +46,8 @@ HDMI 2.1 FRL12 and VRR are proven on this hardware (see Tested Environment and P
 
 | File | Responsibility |
 |---|---|
-| `src/display_switcher.py` | Cold blue-black terminal GTK overlay in Martian Mono: `MONITOR`/`TV` frames with device, transport, `ACTIVE` and `SDR` tags, plus `RESOLUTION`/`REFRESH`/`VRR`/`HDR`/`SCALE` rows from `caps` (VRR/HDR only when capable); prompt shows the exact command; keys `↑↓`/`jk`, `←→`/`hl`, `space`, `tab`/`Super+O`, `1`/`2`, `enter`, `esc`; 5 s countdown; detached apply, `notify-send` failure |
-| `src/display_apply.sh` | Discovery, `status`/`caps`/`ensure`, request preflight, safe transition, generated config, workspace migration, verification |
+| `src/display_switcher.py` | Cold blue-black terminal GTK overlay in Martian Mono: `MONITOR`/`TV` frames with device, transport, `ACTIVE` and `SDR` tags, plus `RESOLUTION`/`REFRESH`/`VRR`/`HDR`/`SCALE` rows from `caps` (VRR/HDR only when capable; scales only where valid, snapped on resolution change); prompt shows the exact command; keys `↑↓`/`jk`, `←→`/`hl`, `space`, `tab`/`Super+O`, `1`/`2`, `enter`, `esc`; 5 s countdown; detached apply, `notify-send` failure |
+| `src/display_apply.sh` | Discovery, `status`/`caps`/`ensure`, request preflight (mode, caps, integral scale), global-VRR composition, safe transition, generated config, workspace migration, Hyprland + DRM verification |
 | `src/display_watch.py` | Hotplug failover: socket2 `monitoradded`/`monitorremoved`, 3 s debounce, runs `ensure` at startup and after events |
 | `config/display-switcher.css` | Cold blue-black terminal theme in Martian Mono: tracked uppercase chrome, italic hints |
 | `monitors.conf` | Comments plus `WAYLAND-1/2` disables; no `monitorv2` blocks (cold-boot fallback is HyDE's `monitor = ,preferred,auto,auto` in `base.conf`) |
@@ -77,8 +77,9 @@ Live-verified after the kernel cutover and reboot:
 - Transport: the TV VBIOS advertises `FRL_12G_EN=0`; the kernel's `force_hdmi21_frl_enc_enable` override for both `dcn30` and `dcn301` forces HDMI 2.1 FRL12 regardless. A stock kernel rebuild silently drops the link below 4K144.
 - Proven TV state: 3840x2160@144.00, `currentFormat` `XRGB2101010` (10-bit), BT2020 RGB colorimetry, color preset `hdr`, VRR true, scale 1.5, `quirks:prefer_hdr=1`, `misc:vrr=1`.
 - Proven monitor state: 3440x1440@74.98, 8-bit, `srgb`, VRR off, `quirks:prefer_hdr=0`, `misc:vrr=0`.
+- Live-verified settings on 2026-11-18 against real hardware and the DRM readout: TV VRR on/off as a VRR-only change, HDR on/off, `3840x2160@120`, scale 1, `2560x1440@120` scale 1.6; monitor VRR on/off as a VRR-only change, scale 1.25/1.6, and the custom `1920x1080@74.65` / `2560x1440@74.89` modelines.
 - Compositor: Hyprland 0.56.2.
-- Dependencies verified by `install.sh`: Bash, `hyprctl`, `jq`, Python 3, PyGObject, GTK3, gtk-layer-shell. Optional capability probes: `modetest` and `di-edid-decode`, used by `caps`; a missing tool reports the capability as false.
+- Dependencies verified by `install.sh`: Bash, `hyprctl`, `jq`, Python 3, PyGObject, GTK3, gtk-layer-shell. Optional capability probes: `modetest` and `di-edid-decode`, used by `caps`, plus `modetest` for the DRM ground-truth check; a missing tool reports the capability as false and skips the DRM check with one log line.
 
 ## Commands
 
