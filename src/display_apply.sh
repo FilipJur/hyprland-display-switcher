@@ -3,20 +3,25 @@
 # Authoritative behavior: ARCHITECTURE.md ("src/display_apply.sh: sole control plane").
 #
 # Modes (exclusive): monitor (PHL 345E2, 3440x1440@74.98, 8-bit SDR,
-# VRR off), cs2 (PHL 345E2, 1920x1080@60, 8-bit SDR, VRR off), and tv
-# (Philips UHDTV on native HDMI, 3840x2160@144, 10-bit HDR, VRR).
+# VRR off), cs2 (PHL 345E2, custom 1920x1080@~75 modeline, GPU pillarbox,
+# 8-bit SDR, VRR off), cs2-2k (PHL 345E2, custom 2560x1440@~75 modeline,
+# GPU pillarbox, 8-bit SDR, VRR off), and tv (Philips UHDTV on native HDMI,
+# 3840x2160@144, 10-bit HDR, VRR).
 # tv-alt is the TV timing at 3840x2160@144 with VRR off: identical mode,
 # metadata and range to tv, so the panel sees the same signal except VRR.
 # Discovery is identity-based (EDID fields + HDMI connector class); connector
 # names are runtime data only. Every apply verifies effective compositor state.
 #
-# CLI:  display_apply.sh status|ensure|monitor|cs2|cs2-2k|tv|tv-alt
+# CLI:  display_apply.sh status|connected|ensure|monitor|cs2|cs2-2k|tv|tv-alt
 # ensure: no-op while any known display is enabled; otherwise enables a
 # connected one (monitor first, then tv). Used by display_watch.py on boot
 # and hotplug so a vanished output never leaves the session dark.
+# connected: one line per connected known display (monitor, then tv), enabled
+# or not; no lock and no mutation. Used by the overlay to decide availability.
 # Exit: 0 success · 2 usage · 3 discovery/preflight (no mutation) ·
 #       4 apply/verification failure · 5 lock held by another apply
-# stdout: `status` token, or one success line for apply. Diagnostics: stderr + log.
+# stdout: `status` token, `connected` role lines, or one success line for
+# apply. Diagnostics: stderr + log.
 # No sudo, no kernel/DRD debugfs/sysfs access, no audio, no daemon restarts.
 
 set -uo pipefail
@@ -47,9 +52,9 @@ TV_DESC="desc:Philips Consumer Electronics Company Philips UHDTV 0x01010101"
 # modes center with side bars instead of stretching. CS2 is 1920x1080@~75
 # (upscaled full-height to 2560x1440 by the GPU); CS2 2K is native 2560x1440@~75.
 MONITOR_PROFILE="mode=3440x1440@74.98 position=0x0 scale=1 bitdepth=8 cm=srgb sdr_eotf=srgb sdrsaturation=1.2 vrr=0"
-TV_PROFILE="mode=3840x2160@144 position=0x0 scale=1.5 bitdepth=10 cm=hdr sdrbrightness=1.0 sdrsaturation=1.0 sdr_min_luminance=0 sdr_max_luminance=200 min_luminance=0 max_luminance=1400 max_avg_luminance=250 supports_hdr=1 supports_wide_color=1 vrr=1"
+TV_PROFILE="mode=3840x2160@144 position=0x0 scale=1.5 bitdepth=10 cm=hdr sdrbrightness=3.0 sdrsaturation=1.0 sdr_min_luminance=0 sdr_max_luminance=200 min_luminance=0 max_luminance=1400 max_avg_luminance=250 supports_hdr=1 supports_wide_color=1 vrr=1"
 # TV_ALT_PROFILE: byte-for-byte TV_PROFILE with one change — vrr 1->0.
-TV_ALT_PROFILE="mode=3840x2160@144 position=0x0 scale=1.5 bitdepth=10 cm=hdr sdrbrightness=1.0 sdrsaturation=1.0 sdr_min_luminance=0 sdr_max_luminance=200 min_luminance=0 max_luminance=1400 max_avg_luminance=250 supports_hdr=1 supports_wide_color=1 vrr=0"
+TV_ALT_PROFILE="mode=3840x2160@144 position=0x0 scale=1.5 bitdepth=10 cm=hdr sdrbrightness=3.0 sdrsaturation=1.0 sdr_min_luminance=0 sdr_max_luminance=200 min_luminance=0 max_luminance=1400 max_avg_luminance=250 supports_hdr=1 supports_wide_color=1 vrr=0"
 CS2_MODELINE="modeline 220.75 1920 2056 2264 2608 1080 1083 1088 1130 -hsync +vsync"
 CS2_PROFILE="position=0x0 scale=1 bitdepth=8 cm=srgb sdr_eotf=srgb sdrsaturation=1.2 vrr=0"
 CS2_2K_MODELINE="modeline 397.25 2560 2760 3040 3520 1440 1443 1448 1506 -hsync +vsync"
@@ -83,6 +88,9 @@ usage() {
   cat >&2 <<'EOF'
 usage: display-apply.sh <command>
 commands:
+  connected print the connected known displays, one role per line: monitor
+            then tv, enabled or not; nothing when none is connected (no
+            lock, no mutation)
   ensure    no-op while any known display is enabled; otherwise enable a
             connected one: monitor first, then tv
   monitor   apply the PHL 345E2 profile: 3440x1440@74.98, 8-bit SDR, VRR
@@ -208,16 +216,13 @@ tv_role() { # tv_role <role> → canonical role for identity/globals
 compute_status() {
   if (( TV_PRESENT && TV_ENABLED )) && ! (( MON_PRESENT && MON_ENABLED )); then
     # tv and tv-alt share the 144 Hz timing; VRR is the discriminator.
-    local _arr _vrr
-    _arr=$(role_match tv "$MONITORS_JSON")
-    _vrr=$(jq -r '.[0].vrr // empty' <<<"$_arr" 2>/dev/null)
+    local _vrr
+    _vrr=$(jq -r '.[0].vrr // empty' <<<"$TV_ARR" 2>/dev/null)
     if [[ "$_vrr" == "true" ]]; then printf 'tv\n'; else printf 'tv-alt\n'; fi
   elif (( MON_PRESENT && MON_ENABLED )) && ! (( TV_PRESENT && TV_ENABLED )); then
-    local arr width height refresh
-    arr=$(role_match monitor "$MONITORS_JSON")
-    width=$(jq -r '.[0].width' <<<"$arr")
-    height=$(jq -r '.[0].height' <<<"$arr")
-    refresh=$(jq -r '.[0].refreshRate' <<<"$arr")
+    local width height
+    width=$(jq -r '.[0].width' <<<"$MON_ARR")
+    height=$(jq -r '.[0].height' <<<"$MON_ARR")
     if [[ "$width" == 1920 && "$height" == 1080 ]]; then
       printf 'cs2\n'
     elif [[ "$width" == 2560 && "$height" == 1440 ]]; then
@@ -232,14 +237,7 @@ compute_status() {
 
 prof() { # prof <role> <key> → value from the single profile definition
   local profile kv
-  case "$1" in
-    monitor) profile="$MONITOR_PROFILE" ;;
-    cs2) profile="$CS2_PROFILE" ;;
-    cs2-2k) profile="$CS2_2K_PROFILE" ;;
-    tv) profile="$TV_PROFILE" ;;
-    tv-alt) profile="$TV_ALT_PROFILE" ;;
-    *) return 1 ;;
-  esac
+  profile=$(prof_all "$1") || return 1
   if [[ "$1" == cs2 && "$2" == mode ]]; then
     printf '%s' "$CS2_MODELINE"
     return 0
@@ -653,6 +651,16 @@ main() {
       fetch_monitors || die 3 "discovery failed: hyprctl -j monitors all returned no valid JSON"
       discover
       compute_status
+      ;;
+    connected)
+      # Snapshot only: no lock, no mutation, no output beyond role lines.
+      require_deps
+      ensure_ipc_sig
+      fetch_monitors || die 3 "discovery failed: hyprctl -j monitors all returned no valid JSON"
+      discover
+      (( MON_PRESENT )) && echo monitor
+      (( TV_PRESENT )) && echo tv
+      exit 0
       ;;
     monitor|cs2|cs2-2k|tv|tv-alt)
       require_deps
