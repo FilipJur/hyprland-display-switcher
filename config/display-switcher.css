@@ -1,188 +1,194 @@
-/* display-switcher.css - Terminal theme */
+/* display-switcher.css - Cold terminal theme */
 
-@define-color term_panel #141312;
-@define-color term_row #1c1b19;
-@define-color term_row_hover #232220;
-@define-color term_border #2e2c29;
-@define-color term_text #e6e1d6;
-@define-color term_muted #7d776d;
-@define-color term_dim #55504a;
-@define-color term_accent #04ddff;
-@define-color term_error #cf7a5c;
+@define-color bg #060a0e;
+@define-color surface #0c1116;
+@define-color raised #141a21;
+@define-color line #2c3742;
+@define-color line_strong #505c69;
+@define-color fg #dde6ec;
+@define-color muted #95a0aa;
+@define-color faint #64707d;
+@define-color signal #7de2fa;
+@define-color bad #f47a7d;
 
 /* ── Backdrop ── */
 #display-switcher {
-    background: rgba(0, 0, 0, 0.62);
+    background: rgba(6, 10, 14, 0.85);
 }
 
+/* One monospace family everywhere; body size only, the prompt is the exception. */
 #display-switcher label {
-    font-family: "IBM Plex Mono", "JetBrainsMono Nerd Font", "DejaVu Sans Mono", monospace;
+    font-family: "Martian Mono", "JetBrainsMono Nerd Font", "DejaVu Sans Mono", monospace;
+    font-size: 12px;
 }
 
 /* ── Panel ── */
 #terminal-panel {
-    background: @term_panel;
-    border: 1px solid @term_border;
-    border-radius: 2px;
-    padding: 18px 22px;
-    box-shadow: 0 12px 32px rgba(0, 0, 0, 0.55);
+    background: @surface;
+    border: 1px solid @line;
+    border-radius: 0;
+    padding: 16px 20px;
     min-width: 640px;
 }
 
-/* ── Header: title · active mode ── */
+/* ── Chrome: uppercase, tracked caps (tracking is a Pango attr, see CHROME_TRACKING) ── */
+#display-switcher .chrome {
+    color: @muted;
+    font-weight: 600;
+}
+
+/* ── Header ── */
 #terminal-header {
-    border-bottom: 1px solid @term_border;
+    border-bottom: 1px solid @line;
     padding-bottom: 10px;
 }
 
-#term-title {
-    color: @term_text;
-    font-size: 16px;
-    font-weight: 600;
+#header-active {
+    color: @muted;
 }
 
-#term-active {
-    color: @term_muted;
-    font-size: 11px;
-}
-
-/* ── Prompt line + blinking block cursor ── */
+/* ── Prompt (the one size step) ── */
 #prompt-row {
-    padding: 4px 0 8px 0;
+    padding: 10px 0;
 }
 
-#prompt-text {
-    color: @term_text;
+#display-switcher #prompt-text {
+    color: @fg;
+    font-size: 16px;
+    font-weight: 500;
+}
+
+#display-switcher #prompt-args {
+    color: @signal;
     font-size: 16px;
     font-weight: 600;
 }
 
-#prompt-mode {
-    color: @term_accent;
-    font-size: 16px;
-    font-weight: 600;
-}
-
-#prompt-cursor {
-    color: @term_accent;
+#display-switcher #prompt-cursor {
+    color: @signal;
     font-size: 16px;
     margin-left: 1px;
 }
 
-#prompt-cursor.off {
+#display-switcher #prompt-cursor.off {
     opacity: 0;
 }
 
-/* ── Group heading: uppercase label · device · not connected ── */
-#group-header {
-    margin: 12px 0 4px 0;
+/* ── Display frames ── */
+#display-frame {
+    background: transparent;
 }
 
-#group-label {
-    color: @term_muted;
-    font-size: 11px;
-    font-weight: 700;
-    letter-spacing: 2px;
-}
-
-#group-device {
-    color: @term_muted;
-    font-size: 11px;
-}
-
-#group-status {
-    color: @term_error;
-    font-size: 11px;
-}
-
-/* ── Mode rows ── */
-#mode-row {
-    background: @term_row;
-    border: 1px solid @term_border;
-    border-left: 3px solid transparent;
+#display-frame > border {
+    border: 1px solid @line_strong;
     border-radius: 0;
-    padding: 6px 10px;
-    margin: 2px 0 2px 16px;
 }
 
-#mode-row:hover {
-    background: @term_row_hover;
+#display-frame.focused > border {
+    border: 1px solid @signal;
 }
 
-#mode-row.selected {
-    background: rgba(4, 221, 255, 0.08);
-    border-color: rgba(4, 221, 255, 0.35);
-    border-left: 3px solid @term_accent;
+#display-frame.disconnected > border {
+    border: 1px solid @line;
 }
 
-#row-number {
-    color: @term_muted;
-    font-size: 11px;
+#display-frame.disconnected #legend-name {
+    color: @faint;
 }
 
-#row-marker {
-    color: @term_accent;
-    font-size: 13px;
-    font-weight: 700;
+#frame-legend {
+    background: @surface;
+    padding: 0 6px;
 }
 
-#row-name {
-    color: @term_text;
-    font-size: 13px;
+#legend-name {
+    color: @muted;
+}
+
+#display-frame.focused #legend-name {
+    color: @signal;
+}
+
+#legend-device {
+    color: @faint;
+}
+
+#legend-note {
+    color: @faint;
+}
+
+#display-switcher #legend-tag {
+    background: @signal;
+    color: @bg;
+    padding: 1px 6px;
+}
+
+/* ── Frame body ── */
+#frame-body {
+    padding: 10px 12px;
+}
+
+#frame-note {
+    color: @faint;
+    font-size: 12px;
+    font-style: italic;
+    padding: 2px 4px;
+}
+
+#frame-note.error {
+    color: @bad;
+}
+
+/* ── Setting rows ── */
+#setting-row {
+    background: transparent;
+    border-left: 2px solid transparent;
+    padding: 3px 8px;
+}
+
+#setting-row.focused {
+    background: @raised;
+    border-left: 2px solid @signal;
+}
+
+#setting-label {
+    color: @muted;
+}
+
+#setting-row.focused #setting-label {
+    color: @signal;
+}
+
+#setting-value {
+    color: @fg;
+    font-size: 12px;
+    font-weight: 500;
+}
+
+#setting-row.focused #setting-value {
+    color: @signal;
     font-weight: 600;
 }
 
-#row-spec {
-    color: @term_muted;
-    font-size: 13px;
+#setting-chevron {
+    color: @faint;
+    font-size: 12px;
 }
 
-#mode-row.selected #row-name {
-    color: @term_accent;
-}
-
-/* ── Status tag ── */
-#row-status {
-    background-color: transparent;
-    background-image: none;
-    border: none;
-    color: @term_muted;
-    font-size: 11px;
-}
-
-#row-status.tag-active {
-    color: @term_accent;
-}
-
-/* ── Unavailable rows: dimmed, never look selectable ── */
-#mode-row.unavailable,
-#mode-row.unavailable:hover,
-#mode-row.unavailable.selected {
-    background: rgba(28, 27, 25, 0.45);
-    border-color: @term_border;
-    border-left: 3px solid transparent;
-}
-
-#mode-row.unavailable #row-number,
-#mode-row.unavailable #row-marker,
-#mode-row.unavailable #row-name,
-#mode-row.unavailable #row-spec,
-#mode-row.unavailable.selected #row-name {
-    color: @term_dim;
-}
-
-/* ── Footer: key hints · countdown ── */
+/* ── Footer ── */
 #footer {
-    border-top: 1px solid @term_border;
+    border-top: 1px solid @line;
     padding-top: 10px;
 }
 
 #footer-hints {
-    color: @term_muted;
-    font-size: 13px;
+    color: @faint;
+    font-size: 12px;
+    font-style: italic;
 }
 
 #countdown {
-    color: @term_muted;
-    font-size: 11px;
+    color: @faint;
+    font-size: 12px;
+    font-style: italic;
 }

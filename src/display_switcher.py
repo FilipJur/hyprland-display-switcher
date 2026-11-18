@@ -1,21 +1,23 @@
 #!/usr/bin/env python3
-"""Hyprland Display Switcher - terminal-style overlay for monitor, CS2 and TV modes.
+"""Hyprland Display Switcher - terminal-style per-display settings overlay.
 
-A CLI-flavoured panel groups the modes by display: an uppercase group heading
-with its device, then one row per mode with aligned number/name/spec columns and
-a status tag. Rows whose display is not connected (per
-`display-apply.sh connected`) are dimmed and skipped when moving; the group
-heading carries the reason. Confirmed modes run detached from the overlay; a
-failed apply raises a desktop notification with the applier's error.
+Top level is the display: each display gets a frame whose legend names it, and
+inside sit the general settings the hardware advertises - resolution, refresh,
+VRR and HDR when capable, scale. Values resolve from the remembered settings
+file, then the display's current state, then its defaults, and only values that
+differ from the defaults are put on the command line (shown in the prompt).
+Displays are probed with `display-apply.sh caps`; applies run detached from the
+overlay and a failure raises a notification with the applier's error.
 """
 
+import json
 import math
 import os
 import signal
 import subprocess
 import sys
 import time
-from typing import Any, Dict, List, Optional, Set
+from typing import Any, Dict, List, Optional, Tuple
 
 import gi
 
@@ -35,160 +37,237 @@ from gi.repository import Gdk, GLib, Gtk
 CSS_FILE = os.path.expanduser("~/.config/hypr/display-switcher.css")
 PID_FILE = os.path.expanduser("~/.local/state/display-switcher.pid")
 APPLIER_SCRIPT = os.path.expanduser("~/.local/bin/display-apply.sh")
-TIMEOUT_SECONDS = 3
+SETTINGS_FILE = os.path.expanduser("~/.local/state/display-switcher-settings.json")
+TIMEOUT_SECONDS = 5
 CURSOR_BLINK_MS = 530
 
-# Display role each group needs, as reported by `display-apply.sh connected`.
-GROUPS: List[Dict[str, Any]] = [
-    {
-        "role": "monitor",
-        "label": "MONITOR",
-        "title": "Monitor",
-        "device": "PHL 345E2 · DP",
-        "modes": [
-            {"id": "monitor", "name": "Desktop", "spec": "3440×1440 · 75 Hz · SDR"},
-            {"id": "cs2", "name": "CS2", "spec": "1080p · 75 Hz · 16:9"},
-        ],
-    },
-    {
-        "role": "tv",
-        "label": "TV",
-        "title": "TV",
-        "device": "Philips UHDTV · HDMI",
-        "modes": [
-            {"id": "tv", "name": "HDR · VRR", "spec": "4K · 144 Hz"},
-            {"id": "tv-alt", "name": "HDR", "spec": "4K · 144 Hz · VRR off"},
-        ],
-    },
-]
+DISPLAY_ROLES = ("monitor", "tv")
+DISPLAY_NAMES = {"monitor": "Monitor", "tv": "TV"}
 
-# Flat row order (digits 1-4); navigation, selection and apply are row-based.
-ROWS: List[Dict[str, Any]] = [
-    {
-        "id": mode["id"],
-        "name": mode["name"],
-        "spec": mode["spec"],
-        "role": group["role"],
-        "group_title": group["title"],
-    }
-    for group in GROUPS
-    for mode in group["modes"]
-]
+# Wide tracking for chrome labels, in Pango units (~2px). Applied as a Pango span
+# attribute so the uppercase hierarchy lever does not depend on GTK3 CSS support.
+CHROME_TRACKING = 2048
 
-# Status tokens the applier may report that have no row of their own.
-STATUS_MODES = {row["id"] for row in ROWS} | {"cs2-2k"}
+
+def chrome_markup(text: str) -> str:
+    return (
+        f'<span letter_spacing="{CHROME_TRACKING}">'
+        f"{GLib.markup_escape_text(text)}</span>"
+    )
+
+
+def chrome_label(text: str, name: str) -> Gtk.Label:
+    label = Gtk.Label()
+    label.set_name(name)
+    label.get_style_context().add_class("chrome")
+    label.set_markup(chrome_markup(text))
+    label.set_xalign(0.0)
+    return label
+
+
+def set_chrome_text(label: Gtk.Label, text: str):
+    label.set_markup(chrome_markup(text))
+
 
 # Runs the applier detached from the overlay; on failure notifies with its last
 # stderr line (log prefix stripped) and keeps the applier's exit code.
-# $0 = applier script, $1 = mode id, $2 = notification name.
+# $0 = applier script, $1 = display name, remaining args = role + settings.
 APPLY_WRAPPER = r"""
-err=$("$0" "$1" 2>&1 >/dev/null)
+name=$1
+shift
+err=$("$0" "$@" 2>&1 >/dev/null)
 rc=$?
 if [ "$rc" -ne 0 ]; then
     msg=$(printf '%s\n' "$err" | tail -n 1 | sed 's/^\[[^]]*\] //')
     [ -n "$msg" ] || msg="exit code $rc"
-    notify-send -a "Display switcher" -u critical "$2 failed" "$msg" || true
+    notify-send -a "Display switcher" -u critical "$name failed" "$msg" || true
 fi
 exit "$rc"
 """
 
 
-class GroupHeader(Gtk.Box):
-    """Uppercase display heading: label, device and the reason it is unavailable."""
-
-    def __init__(self, group: Dict[str, Any]):
-        super().__init__(orientation=Gtk.Orientation.HORIZONTAL, spacing=10)
-        self.role = group["role"]
-        self.set_name("group-header")
-
-        label = Gtk.Label(label=group["label"])
-        label.set_name("group-label")
-        label.set_xalign(0.0)
-
-        device = Gtk.Label(label=group["device"])
-        device.set_name("group-device")
-        device.set_xalign(0.0)
-
-        self.status = Gtk.Label(label="")
-        self.status.set_name("group-status")
-        self.status.set_xalign(1.0)
-        self.status.set_hexpand(True)
-
-        self.pack_start(label, False, False, 0)
-        self.pack_start(device, False, False, 0)
-        self.pack_end(self.status, True, True, 0)
-
-    def set_available(self, available: bool):
-        self.status.set_text("" if available else "not connected")
+def format_hz(hz: float) -> str:
+    """144 Hz for integral rates, 74.98 Hz otherwise."""
+    if abs(hz - round(hz)) < 0.01:
+        return f"{round(hz)} Hz"
+    return f"{hz:.2f} Hz"
 
 
-class ModeRow(Gtk.Box):
-    """One menu row: number, marker, mode name, spec and status tag."""
+def format_hz_arg(hz: float) -> str:
+    if abs(hz - round(hz)) < 0.01:
+        return str(round(hz))
+    return f"{hz:.2f}"
+
+
+def format_scale(scale: float) -> str:
+    return f"{scale:g}"
+
+
+def load_remembered() -> Dict[str, Any]:
+    try:
+        with open(SETTINGS_FILE, "r") as f:
+            data = json.load(f)
+    except (OSError, ValueError):
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def save_remembered(data: Dict[str, Any]):
+    try:
+        os.makedirs(os.path.dirname(SETTINGS_FILE), exist_ok=True)
+        tmp_file = f"{SETTINGS_FILE}.tmp"
+        with open(tmp_file, "w") as f:
+            json.dump(data, f, indent=2)
+            f.write("\n")
+        os.replace(tmp_file, SETTINGS_FILE)
+    except OSError as e:
+        print(f"Error saving display settings: {e}", file=sys.stderr)
+
+
+class SettingRow(Gtk.Box):
+    """One setting line: tracked label, then a choice or a boolean state."""
 
     def __init__(
-        self, row_data: Dict[str, Any], number: int, size_groups: List[Gtk.SizeGroup]
+        self,
+        key: str,
+        label_text: str,
+        label_size_group: Gtk.SizeGroup,
+        choices: bool,
     ):
-        super().__init__(orientation=Gtk.Orientation.HORIZONTAL, spacing=12)
-        self.mode_id = row_data["id"]
-        self._current = False
-        self._available = True
+        super().__init__(orientation=Gtk.Orientation.HORIZONTAL, spacing=10)
+        self.key = key
+        self.set_name("setting-row")
 
-        self.set_name("mode-row")
+        self.label = chrome_label(label_text, "setting-label")
+        self.label.set_width_chars(10)
+        label_size_group.add_widget(self.label)
+        self.pack_start(self.label, False, False, 0)
 
-        self.number = self._make_label(str(number), "row-number")
-        self.number.set_width_chars(1)
-        self.marker = self._make_label(" ", "row-marker")
-        self.marker.set_width_chars(1)
-        self.name = self._make_label(row_data["name"], "row-name")
-        # Reserve a ~12-char name column so specs never read as part of the name.
-        self.name.set_width_chars(12)
-        self.spec = self._make_label(row_data["spec"], "row-spec")
-        self.status = self._make_label("", "row-status")
-        self.status.set_xalign(1.0)
-        self.status.set_hexpand(True)
-
-        # Status is not size-grouped: it takes the rest of the row and right-aligns
-        # against the row padding, so every tag ends on the same edge.
-        for column, label in enumerate(
-            (self.number, self.marker, self.name, self.spec)
-        ):
-            size_groups[column].add_widget(label)
-            self.pack_start(label, False, False, 0)
-        self.pack_end(self.status, True, True, 0)
+        self.value_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
+        self.value_box.set_name("setting-value-box")
+        self.value = Gtk.Label(label="")
+        self.value.set_name("setting-value")
+        self.value.set_xalign(0.0)
+        if choices:
+            self.value_box.pack_start(self._chevron("‹"), False, False, 0)
+            self.value_box.pack_start(self.value, False, False, 0)
+            self.value_box.pack_start(self._chevron("›"), False, False, 0)
+        else:
+            self.value_box.pack_start(self.value, False, False, 0)
+        self.pack_start(self.value_box, False, False, 0)
 
     @staticmethod
-    def _make_label(text: str, name: str) -> Gtk.Label:
-        label = Gtk.Label(label=text)
-        label.set_name(name)
-        label.set_xalign(0.0)
-        return label
+    def _chevron(glyph: str) -> Gtk.Label:
+        chevron = Gtk.Label(label=glyph)
+        chevron.set_name("setting-chevron")
+        chevron.set_xalign(0.0)
+        return chevron
 
-    def set_selected(self, selected: bool):
-        self.marker.set_text("›" if selected else " ")
-        if selected:
-            self.get_style_context().add_class("selected")
+    def set_value(self, text: str):
+        self.value.set_text(text)
+
+    def set_focused(self, focused: bool):
+        context = self.get_style_context()
+        if focused:
+            context.add_class("focused")
         else:
-            self.get_style_context().remove_class("selected")
+            context.remove_class("focused")
 
-    def set_current(self, current: bool):
-        self._current = current
-        self._sync_status()
 
-    def set_available(self, available: bool):
-        self._available = available
-        if available:
-            self.get_style_context().remove_class("unavailable")
+class DisplayView(Gtk.Frame):
+    """One display frame: legend cut into the border, settings rows inside."""
+
+    def __init__(self, role: str, display: Optional[Dict[str, Any]]):
+        super().__init__()
+        self.role = role
+        self.display = display
+        self.settings: Optional[Dict[str, Any]] = None
+        self.rows: Dict[str, SettingRow] = {}
+
+        self.set_name("display-frame")
+        if display is not None and not display.get("connected"):
+            self.get_style_context().add_class("disconnected")
+
+        legend = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+        legend.set_name("frame-legend")
+
+        name = chrome_label(role.upper(), "legend-name")
+        legend.pack_start(name, False, False, 0)
+
+        device = Gtk.Label(label=self._device_text())
+        device.set_name("legend-device")
+        device.set_xalign(0.0)
+        legend.pack_start(device, False, False, 0)
+
+        spacer = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL)
+        spacer.set_hexpand(True)
+        legend.pack_start(spacer, True, True, 0)
+
+        self.legend_note = Gtk.Label(label="")
+        self.legend_note.set_name("legend-note")
+        self.legend_note.set_no_show_all(True)
+        self.legend_note.set_visible(False)
+        legend.pack_start(self.legend_note, False, False, 0)
+
+        self.legend_tag = chrome_label("ACTIVE", "legend-tag")
+        self.legend_tag.set_no_show_all(True)
+        self.legend_tag.set_visible(bool(display and display.get("enabled")))
+        legend.pack_start(self.legend_tag, False, False, 0)
+
+        self.set_label_widget(legend)
+
+        if (
+            display is not None
+            and display.get("connected")
+            and not display.get("hdr_capable")
+        ):
+            self.legend_note.set_text("SDR")
+            self.legend_note.set_visible(True)
+
+        body = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4)
+        body.set_name("frame-body")
+
+        self.note = Gtk.Label(label="")
+        self.note.set_name("frame-note")
+        self.note.set_xalign(0.0)
+        self.note.set_no_show_all(True)
+        self.note.set_visible(False)
+        body.pack_start(self.note, False, False, 0)
+
+        self.rows_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=2)
+        self.rows_box.set_name("setting-list")
+        body.pack_start(self.rows_box, False, False, 0)
+
+        self.add(body)
+
+    def _device_text(self) -> str:
+        if not self.display:
+            return ""
+        device = self.display.get("device") or ""
+        transport = self.display.get("transport")
+        if transport:
+            return f"{device} │ {transport}" if device else transport
+        return device
+
+    def set_note(self, text: str, error: bool = False):
+        self.note.set_text(text)
+        context = self.note.get_style_context()
+        if error:
+            context.add_class("error")
         else:
-            self.get_style_context().add_class("unavailable")
+            context.remove_class("error")
+        self.note.set_visible(bool(text))
 
-    def _sync_status(self):
-        context = self.status.get_style_context()
-        if self._current:
-            self.status.set_text("● active")
-            context.add_class("tag-active")
-        else:
-            self.status.set_text("")
-            context.remove_class("tag-active")
+    def add_row(
+        self,
+        key: str,
+        label: str,
+        choices: bool,
+        label_size_group: Gtk.SizeGroup,
+    ):
+        row = SettingRow(key, label, label_size_group, choices)
+        self.rows[key] = row
+        self.rows_box.pack_start(row, False, False, 0)
 
 
 class DisplaySwitcher(Gtk.Window):
@@ -217,20 +296,17 @@ class DisplaySwitcher(Gtk.Window):
 
         self.load_css()
 
-        self.current_mode = "unknown"
-        self.connected_roles: Optional[Set[str]] = None
-        self.selection_interacted = False
-        self.status_process = None
-        self.status_poll_id = None
-        self.connected_process = None
-        self.connected_poll_id = None
+        self.caps: Optional[Dict[str, Any]] = None
+        self.remembered: Dict[str, Any] = load_remembered()
+        self.views: Dict[str, DisplayView] = {}
+        self.focus_rows: List[Tuple[str, str]] = []
+        self.focus_index: Optional[int] = None
+        self.caps_process = None
+        self.caps_poll_id = None
         self.timeout_id = None
         self.cursor_timer_id = None
         self.cursor_dimmed = False
         self.deadline = 0.0
-        self.rows: List[ModeRow] = []
-        self.group_headers: List[GroupHeader] = []
-        self.selected_index = self.get_next_index()
 
         self.build_ui()
 
@@ -239,39 +315,33 @@ class DisplaySwitcher(Gtk.Window):
         signal.signal(signal.SIGUSR1, self.on_cycle_signal)
 
         self.show_all()
-        self.request_status()
-        self.request_connected()
+        self.rebuild(None)
+        self.request_caps()
         self.reset_timer()
         self.cursor_timer_id = GLib.timeout_add(CURSOR_BLINK_MS, self.on_cursor_blink)
 
-    def is_available_role(self, role: str) -> bool:
-        """Unknown availability (not queried yet, or discovery failed) counts as available."""
-        if self.connected_roles is None:
-            return True
-        return role in self.connected_roles
+    # ------------------------------------------------------------- probing --
 
-    def is_available(self, index: int) -> bool:
-        return self.is_available_role(ROWS[index]["role"])
-
-    def request_connected(self):
-        """Read the connected displays without blocking the GTK main loop."""
+    def request_caps(self):
+        """Read display capabilities without blocking the GTK main loop."""
         try:
-            self.connected_process = subprocess.Popen(
-                [APPLIER_SCRIPT, "connected"],
+            self.caps_process = subprocess.Popen(
+                [APPLIER_SCRIPT, "caps"],
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
                 text=True,
             )
         except (OSError, subprocess.SubprocessError) as e:
-            print(f"Error checking connected displays: {e}", file=sys.stderr)
+            print(f"Error probing displays: {e}", file=sys.stderr)
+            self.rebuild(None, failed=True)
             return
 
-        self.connected_poll_id = GLib.timeout_add(50, self.poll_connected)
+        self.caps_poll_id = GLib.timeout_add(50, self.poll_caps)
 
-    def poll_connected(self):
-        process = self.connected_process
+    def poll_caps(self):
+        process = self.caps_process
         if process is None:
-            self.connected_poll_id = None
+            self.caps_poll_id = None
             return False
         if process.poll() is None:
             return True
@@ -282,391 +352,402 @@ class DisplaySwitcher(Gtk.Window):
             stdout = ""
             stderr = str(e)
 
-        self.connected_process = None
-        self.connected_poll_id = None
+        self.caps_process = None
+        self.caps_poll_id = None
         if stderr and stderr.strip():
             print(stderr.rstrip(), file=sys.stderr)
 
+        caps = None
         if process.returncode == 0:
-            self.connected_roles = set((stdout or "").split())
-        else:
-            self.connected_roles = None
+            try:
+                caps = json.loads(stdout or "")
+            except ValueError:
+                caps = None
 
-        self.refresh_availability()
+        if isinstance(caps, dict) and isinstance(caps.get("displays"), list):
+            self.rebuild(caps)
+        else:
+            self.rebuild(None, failed=True)
         return False
 
-    def refresh_availability(self):
-        if not self.rows:
-            return
-        for i, row in enumerate(self.rows):
-            row.set_available(self.is_available(i))
-        for header in self.group_headers:
-            header.set_available(self.is_available_role(header.role))
-        self.refresh_selection()
+    # --------------------------------------------------------------- setup --
 
-    def request_status(self):
-        """Read the applier's status without blocking the GTK main loop."""
-        try:
-            self.status_process = subprocess.Popen(
-                [APPLIER_SCRIPT, "status"],
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                text=True,
+    def rebuild(self, caps: Optional[Dict[str, Any]], failed: bool = False):
+        self.caps = caps
+        for child in self.frames_box.get_children():
+            child.destroy()
+        self.views = {}
+        self.focus_rows = []
+        self.focus_index = None
+
+        displays = caps.get("displays") if caps else None
+        if not displays:
+            note = "caps unavailable" if failed else "probing…"
+            for role in DISPLAY_ROLES:
+                view = DisplayView(role, None)
+                view.set_note(note, error=failed)
+                self.views[role] = view
+                self.frames_box.pack_start(view, False, False, 0)
+            self.header_active.set_markup(chrome_markup("ACTIVE · NONE"))
+        else:
+            for display in displays:
+                role = display.get("role")
+                if not role or role in self.views:
+                    continue
+                view = DisplayView(role, display)
+                self.views[role] = view
+                self.frames_box.pack_start(view, False, False, 0)
+                if not display.get("connected"):
+                    view.set_note("not connected")
+                    continue
+                view.settings = self.resolve_settings(display)
+                for key in self.build_rows(view):
+                    self.focus_rows.append((role, key))
+            active = caps.get("active")
+            set_chrome_text(
+                self.header_active,
+                f"ACTIVE · {str(active).upper()}"
+                if active in self.views
+                else "ACTIVE · NONE",
             )
-        except (OSError, subprocess.SubprocessError) as e:
-            print(f"Error checking display status: {e}", file=sys.stderr)
-            self.set_current_mode("unknown")
-            return
 
-        self.status_poll_id = GLib.timeout_add(50, self.poll_status)
+        self.frames_box.show_all()
+        self.apply_initial_focus()
+        for role in self.views:
+            self.refresh_view(role)
+        self.update_prompt()
 
-    def poll_status(self):
-        process = self.status_process
-        if process is None:
-            self.status_poll_id = None
-            return False
-        if process.poll() is None:
-            return True
-
-        try:
-            stdout, stderr = process.communicate()
-        except (OSError, subprocess.SubprocessError) as e:
-            stdout = ""
-            stderr = str(e)
-
-        self.status_process = None
-        self.status_poll_id = None
-        if stderr and stderr.strip():
-            print(stderr.rstrip(), file=sys.stderr)
-
-        status = (stdout or "").strip() if process.returncode == 0 else "unknown"
-        self.set_current_mode(status)
-        return False
-
-    def describe_mode(self, mode: str) -> str:
-        """Return "Monitor · Desktop" for a row, the bare token otherwise (cs2-2k)."""
-        for row in ROWS:
-            if row["id"] == mode:
-                return f"{row['group_title']} · {row['name']}"
-        return mode
-
-    def set_current_mode(self, mode: str):
-        if mode not in STATUS_MODES:
-            mode = "unknown"
-        self.current_mode = mode
-        self.active_label.set_text(f"active: {self.describe_mode(mode)}")
-
-        for row in self.rows:
-            row.set_current(row.mode_id == mode)
-
-        self.refresh_selection()
-
-    def refresh_selection(self):
-        if not self.selection_interacted and self.rows:
-            self.set_selected_index(self.get_next_index())
-
-    def load_css(self):
-        css_provider = Gtk.CssProvider()
-        try:
-            if os.path.exists(CSS_FILE):
-                css_provider.load_from_path(CSS_FILE)
-            else:
-                css_provider.load_from_data(self.default_css().encode())
-            screen = Gdk.Screen.get_default()
-            if screen:
-                Gtk.StyleContext.add_provider_for_screen(
-                    screen, css_provider, Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION
-                )
-        except Exception as e:
-            print(f"CSS warning: {e}", file=sys.stderr)
-
-    def default_css(self) -> str:
-        return """
-/* display-switcher.css - Terminal theme */
-
-@define-color term_panel #141312;
-@define-color term_row #1c1b19;
-@define-color term_row_hover #232220;
-@define-color term_border #2e2c29;
-@define-color term_text #e6e1d6;
-@define-color term_muted #7d776d;
-@define-color term_dim #55504a;
-@define-color term_accent #04ddff;
-@define-color term_error #cf7a5c;
-
-/* ── Backdrop ── */
-#display-switcher {
-    background: rgba(0, 0, 0, 0.62);
-}
-
-#display-switcher label {
-    font-family: "IBM Plex Mono", "JetBrainsMono Nerd Font", "DejaVu Sans Mono", monospace;
-}
-
-/* ── Panel ── */
-#terminal-panel {
-    background: @term_panel;
-    border: 1px solid @term_border;
-    border-radius: 2px;
-    padding: 18px 22px;
-    box-shadow: 0 12px 32px rgba(0, 0, 0, 0.55);
-    min-width: 640px;
-}
-
-/* ── Header: title · active mode ── */
-#terminal-header {
-    border-bottom: 1px solid @term_border;
-    padding-bottom: 10px;
-}
-
-#term-title {
-    color: @term_text;
-    font-size: 16px;
-    font-weight: 600;
-}
-
-#term-active {
-    color: @term_muted;
-    font-size: 11px;
-}
-
-/* ── Prompt line + blinking block cursor ── */
-#prompt-row {
-    padding: 4px 0 8px 0;
-}
-
-#prompt-text {
-    color: @term_text;
-    font-size: 16px;
-    font-weight: 600;
-}
-
-#prompt-mode {
-    color: @term_accent;
-    font-size: 16px;
-    font-weight: 600;
-}
-
-#prompt-cursor {
-    color: @term_accent;
-    font-size: 16px;
-    margin-left: 1px;
-}
-
-#prompt-cursor.off {
-    opacity: 0;
-}
-
-/* ── Group heading: uppercase label · device · not connected ── */
-#group-header {
-    margin: 12px 0 4px 0;
-}
-
-#group-label {
-    color: @term_muted;
-    font-size: 11px;
-    font-weight: 700;
-    letter-spacing: 2px;
-}
-
-#group-device {
-    color: @term_muted;
-    font-size: 11px;
-}
-
-#group-status {
-    color: @term_error;
-    font-size: 11px;
-}
-
-/* ── Mode rows ── */
-#mode-row {
-    background: @term_row;
-    border: 1px solid @term_border;
-    border-left: 3px solid transparent;
-    border-radius: 0;
-    padding: 6px 10px;
-    margin: 2px 0 2px 16px;
-}
-
-#mode-row:hover {
-    background: @term_row_hover;
-}
-
-#mode-row.selected {
-    background: rgba(4, 221, 255, 0.08);
-    border-color: rgba(4, 221, 255, 0.35);
-    border-left: 3px solid @term_accent;
-}
-
-#row-number {
-    color: @term_muted;
-    font-size: 11px;
-}
-
-#row-marker {
-    color: @term_accent;
-    font-size: 13px;
-    font-weight: 700;
-}
-
-#row-name {
-    color: @term_text;
-    font-size: 13px;
-    font-weight: 600;
-}
-
-#row-spec {
-    color: @term_muted;
-    font-size: 13px;
-}
-
-#mode-row.selected #row-name {
-    color: @term_accent;
-}
-
-/* ── Status tag ── */
-#row-status {
-    background-color: transparent;
-    background-image: none;
-    border: none;
-    color: @term_muted;
-    font-size: 11px;
-}
-
-#row-status.tag-active {
-    color: @term_accent;
-}
-
-/* ── Unavailable rows: dimmed, never look selectable ── */
-#mode-row.unavailable,
-#mode-row.unavailable:hover,
-#mode-row.unavailable.selected {
-    background: rgba(28, 27, 25, 0.45);
-    border-color: @term_border;
-    border-left: 3px solid transparent;
-}
-
-#mode-row.unavailable #row-number,
-#mode-row.unavailable #row-marker,
-#mode-row.unavailable #row-name,
-#mode-row.unavailable #row-spec,
-#mode-row.unavailable.selected #row-name {
-    color: @term_dim;
-}
-
-/* ── Footer: key hints · countdown ── */
-#footer {
-    border-top: 1px solid @term_border;
-    padding-top: 10px;
-}
-
-#footer-hints {
-    color: @term_muted;
-    font-size: 13px;
-}
-
-#countdown {
-    color: @term_muted;
-    font-size: 11px;
-}
-"""
-
-    def get_next_index(self) -> int:
-        mode_ids = [row["id"] for row in ROWS]
-        if self.current_mode in mode_ids:
-            base = (mode_ids.index(self.current_mode) + 1) % len(ROWS)
-        else:
-            base = 0
-        for step in range(len(ROWS)):
-            candidate = (base + step) % len(ROWS)
-            if self.is_available(candidate):
-                return candidate
-        return base
-
-    def build_ui(self):
-        self.set_name("display-switcher")
-
-        overlay = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
-        overlay.set_halign(Gtk.Align.FILL)
-        overlay.set_valign(Gtk.Align.FILL)
-
-        center = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL)
-        center.set_halign(Gtk.Align.CENTER)
-        center.set_valign(Gtk.Align.CENTER)
-
-        panel = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=10)
-        panel.set_name("terminal-panel")
-        panel.set_halign(Gtk.Align.CENTER)
-        panel.set_valign(Gtk.Align.CENTER)
-
-        header = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=12)
-        header.set_name("terminal-header")
-        title = Gtk.Label(label="Display switcher")
-        title.set_name("term-title")
-        title.set_xalign(0.0)
-        self.active_label = Gtk.Label(
-            label=f"active: {self.describe_mode(self.current_mode)}"
-        )
-        self.active_label.set_name("term-active")
-        self.active_label.set_xalign(1.0)
-        self.active_label.set_hexpand(True)
-        header.pack_start(title, False, False, 0)
-        header.pack_start(self.active_label, True, True, 0)
-
-        prompt_row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=0)
-        prompt_row.set_name("prompt-row")
-        prompt = Gtk.Label(label="$ display-apply.sh")
-        prompt.set_name("prompt-text")
-        prompt.set_xalign(0.0)
-        self.prompt_mode = Gtk.Label(label="")
-        self.prompt_mode.set_name("prompt-mode")
-        self.prompt_mode.set_xalign(0.0)
-        self.cursor = Gtk.Label(label="▌")
-        self.cursor.set_name("prompt-cursor")
-        self.cursor.set_xalign(0.0)
-        prompt_row.pack_start(prompt, False, False, 0)
-        prompt_row.pack_start(self.prompt_mode, False, False, 0)
-        prompt_row.pack_start(self.cursor, False, False, 0)
-
-        size_groups = [
-            Gtk.SizeGroup(mode=Gtk.SizeGroupMode.HORIZONTAL) for _ in range(4)
+    def build_rows(self, view: DisplayView) -> List[str]:
+        display = view.display or {}
+        if not display.get("modes"):
+            return []
+        keys: List[Tuple[str, str, bool]] = [
+            ("res", "RESOLUTION", True),
+            ("hz", "REFRESH", True),
         ]
-        rows_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=0)
-        rows_box.set_name("mode-list")
-        for group in GROUPS:
-            header_row = GroupHeader(group)
-            self.group_headers.append(header_row)
-            rows_box.pack_start(header_row, False, False, 0)
-            for mode in group["modes"]:
-                row = ModeRow(mode, len(self.rows) + 1, size_groups)
-                self.rows.append(row)
-                rows_box.pack_start(row, False, False, 0)
+        if display.get("vrr_capable"):
+            keys.append(("vrr", "VRR", False))
+        if display.get("hdr_capable"):
+            keys.append(("hdr", "HDR", False))
+        if display.get("scales"):
+            keys.append(("scale", "SCALE", True))
+        for key, label, choices in keys:
+            view.add_row(key, label, choices, self.label_size_group)
+        return [key for key, _, _ in keys]
 
-        footer = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=12)
-        footer.set_name("footer")
-        hints = Gtk.Label(label="↑↓ move · 1–4 jump · enter apply · esc cancel")
-        hints.set_name("footer-hints")
-        hints.set_xalign(0.0)
-        self.countdown = Gtk.Label(label="")
-        self.countdown.set_name("countdown")
-        self.countdown.set_xalign(1.0)
-        self.countdown.set_hexpand(True)
-        footer.pack_start(hints, False, False, 0)
-        footer.pack_end(self.countdown, True, True, 0)
+    # ------------------------------------------------------------ settings --
 
-        panel.pack_start(header, False, False, 0)
-        panel.pack_start(prompt_row, False, False, 0)
-        panel.pack_start(rows_box, False, False, 0)
-        panel.pack_start(footer, False, False, 0)
+    def resolve_settings(self, display: Dict[str, Any]) -> Dict[str, Any]:
+        role = display.get("role")
+        for candidate in (
+            self.remembered.get(role),
+            display.get("current"),
+            display.get("defaults"),
+        ):
+            settings = self.sanitize_settings(display, candidate)
+            if settings is not None:
+                return settings
+        return self.fallback_settings(display)
 
-        center.pack_start(panel, False, False, 0)
-        overlay.pack_start(center, True, True, 0)
-        self.add(overlay)
+    @staticmethod
+    def sanitize_settings(
+        display: Dict[str, Any], candidate: Any
+    ) -> Optional[Dict[str, Any]]:
+        if not isinstance(candidate, dict):
+            return None
+        modes = {
+            mode.get("res"): mode.get("rates") or []
+            for mode in display.get("modes") or []
+        }
+        res = candidate.get("res")
+        if res not in modes:
+            return None
+        hz = candidate.get("hz")
+        if not isinstance(hz, (int, float)):
+            return None
+        rate = next(
+            (r for r in modes[res] if abs(r.get("hz", 0) - hz) <= 0.1), None
+        )
+        if rate is None:
+            return None
+        scale = candidate.get("scale")
+        if not isinstance(scale, (int, float)):
+            return None
+        scales = display.get("scales") or []
+        matched_scale = next((s for s in scales if abs(s - scale) <= 0.001), None)
+        if matched_scale is None:
+            return None
+        return {
+            "res": res,
+            "hz": rate["hz"],
+            "vrr": bool(candidate.get("vrr")) and bool(display.get("vrr_capable")),
+            "hdr": bool(candidate.get("hdr")) and bool(display.get("hdr_capable")),
+            "scale": matched_scale,
+        }
 
-        for row in self.rows:
-            row.set_current(row.mode_id == self.current_mode)
-        self.refresh_availability()
+    @staticmethod
+    def fallback_settings(display: Dict[str, Any]) -> Dict[str, Any]:
+        modes = display.get("modes") or []
+        rates = (modes[0].get("rates") or []) if modes else []
+        scales = display.get("scales") or [1]
+        return {
+            "res": modes[0]["res"] if modes else "",
+            "hz": rates[0]["hz"] if rates else 0.0,
+            "vrr": False,
+            "hdr": False,
+            "scale": scales[0],
+        }
+
+    @staticmethod
+    def _rates_for(display: Dict[str, Any], res: str) -> List[Dict[str, Any]]:
+        for mode in display.get("modes") or []:
+            if mode.get("res") == res:
+                return mode.get("rates") or []
+        return []
+
+    @classmethod
+    def _rate_for(
+        cls, display: Dict[str, Any], res: str, hz: float
+    ) -> Optional[Dict[str, Any]]:
+        for rate in cls._rates_for(display, res):
+            if abs(rate.get("hz", 0) - hz) <= 0.1:
+                return rate
+        return None
+
+    # --------------------------------------------------------------- focus --
+
+    def focused(self) -> Optional[Tuple[str, str]]:
+        if self.focus_index is None or not self.focus_rows:
+            return None
+        return self.focus_rows[self.focus_index]
+
+    def focused_role(self) -> Optional[str]:
+        current = self.focused()
+        return current[0] if current else None
+
+    def apply_initial_focus(self):
+        """First connected, non-active display; the active one if that is all."""
+        if not self.focus_rows:
+            self.set_focus(None)
+            return
+        roles: List[str] = []
+        for role, _ in self.focus_rows:
+            if role not in roles:
+                roles.append(role)
+        active = (self.caps or {}).get("active", "unknown")
+        target = next((role for role in roles if role != active), roles[0])
+        index = next(i for i, (role, _) in enumerate(self.focus_rows) if role == target)
+        self.set_focus(index)
+
+    def set_focus(self, index: Optional[int]):
+        if index is None or not self.focus_rows:
+            self.focus_index = None
+        else:
+            self.focus_index = index % len(self.focus_rows)
+        current = (
+            self.focus_rows[self.focus_index] if self.focus_index is not None else None
+        )
+        for view in self.views.values():
+            frame_context = view.get_style_context()
+            if current is not None and current[0] == view.role:
+                frame_context.add_class("focused")
+            else:
+                frame_context.remove_class("focused")
+            for key, row in view.rows.items():
+                row.set_focused(current is not None and current == (view.role, key))
+        self.update_prompt()
+
+    def move_focus(self, delta: int):
+        if not self.focus_rows:
+            return
+        if self.focus_index is None:
+            self.set_focus(0)
+            return
+        self.set_focus(self.focus_index + delta)
+
+    def next_display(self):
+        if not self.focus_rows:
+            return
+        roles: List[str] = []
+        for role, _ in self.focus_rows:
+            if role not in roles:
+                roles.append(role)
+        current = self.focused_role()
+        if current in roles:
+            target = roles[(roles.index(current) + 1) % len(roles)]
+        else:
+            target = roles[0]
+        index = next(i for i, (role, _) in enumerate(self.focus_rows) if role == target)
+        self.set_focus(index)
+
+    # -------------------------------------------------------------- values --
+
+    def refresh_view(self, role: str):
+        view = self.views.get(role)
+        if not view or not view.settings:
+            return
+        display = view.display or {}
+        for key, row in view.rows.items():
+            row.set_value(self.value_text(display, view.settings, key))
+
+    def value_text(
+        self, display: Dict[str, Any], settings: Dict[str, Any], key: str
+    ) -> str:
+        if key == "res":
+            return settings["res"].replace("x", "×")
+        if key == "hz":
+            text = format_hz(settings["hz"])
+            rate = self._rate_for(display, settings["res"], settings["hz"])
+            custom = rate.get("custom") if rate else None
+            return f"{text} · {custom}" if custom else text
+        if key in ("vrr", "hdr"):
+            return "[x]" if settings.get(key) else "[ ]"
+        if key == "scale":
+            return format_scale(settings["scale"])
+        return ""
+
+    def change_value(self, delta: int):
+        current = self.focused()
+        if current is None:
+            return
+        role, key = current
+        view = self.views[role]
+        display = view.display or {}
+        settings = view.settings
+        if not settings:
+            return
+        if key == "res":
+            self.cycle_resolution(display, settings, delta)
+        elif key == "hz":
+            self.cycle_refresh(display, settings, delta)
+        elif key in ("vrr", "hdr"):
+            settings[key] = not settings[key]
+        elif key == "scale":
+            self.cycle_scale(display, settings, delta)
+        self.refresh_view(role)
+        self.update_prompt()
+
+    def toggle_value(self):
+        current = self.focused()
+        if current is None or current[1] not in ("vrr", "hdr"):
+            return
+        role, key = current
+        settings = self.views[role].settings
+        if not settings:
+            return
+        settings[key] = not settings[key]
+        self.refresh_view(role)
+        self.update_prompt()
+
+    def cycle_resolution(
+        self, display: Dict[str, Any], settings: Dict[str, Any], delta: int
+    ):
+        resolutions = [mode.get("res") for mode in display.get("modes") or []]
+        if settings.get("res") not in resolutions:
+            return
+        index = resolutions.index(settings["res"])
+        new_res = resolutions[(index + delta) % len(resolutions)]
+        rates = self._rates_for(display, new_res)
+        if not rates:
+            return
+        keep = self._rate_for(display, new_res, settings.get("hz", 0))
+        settings["res"] = new_res
+        settings["hz"] = keep["hz"] if keep else rates[0]["hz"]
+
+    def cycle_refresh(
+        self, display: Dict[str, Any], settings: Dict[str, Any], delta: int
+    ):
+        rates = self._rates_for(display, settings.get("res"))
+        if not rates:
+            return
+        index = next(
+            (
+                i
+                for i, rate in enumerate(rates)
+                if abs(rate.get("hz", 0) - settings.get("hz", 0)) <= 0.1
+            ),
+            0,
+        )
+        settings["hz"] = rates[(index + delta) % len(rates)]["hz"]
+
+    def cycle_scale(
+        self, display: Dict[str, Any], settings: Dict[str, Any], delta: int
+    ):
+        scales = display.get("scales") or []
+        if not scales:
+            return
+        index = next(
+            (
+                i
+                for i, scale in enumerate(scales)
+                if abs(scale - settings.get("scale", 0)) <= 0.001
+            ),
+            0,
+        )
+        settings["scale"] = scales[(index + delta) % len(scales)]
+
+    # --------------------------------------------------------------- apply --
+
+    def command_args(self, role: str) -> List[str]:
+        view = self.views.get(role)
+        if not view or not view.settings:
+            return []
+        display = view.display or {}
+        settings = view.settings
+        defaults = display.get("defaults") or {}
+        args: List[str] = []
+        if settings["res"] != defaults.get("res"):
+            args.append(f"res={settings['res']}")
+        if abs(settings["hz"] - defaults.get("hz", settings["hz"])) > 0.05:
+            args.append(f"hz={format_hz_arg(settings['hz'])}")
+        if bool(settings["vrr"]) != bool(defaults.get("vrr")):
+            args.append(f"vrr={1 if settings['vrr'] else 0}")
+        if bool(settings["hdr"]) != bool(defaults.get("hdr")):
+            args.append(f"hdr={1 if settings['hdr'] else 0}")
+        if abs(settings["scale"] - defaults.get("scale", settings["scale"])) > 0.001:
+            args.append(f"scale={format_scale(settings['scale'])}")
+        return args
+
+    def update_prompt(self):
+        role = self.focused_role()
+        if not role:
+            self.prompt_args.set_text("")
+            return
+        parts = [role] + self.command_args(role)
+        self.prompt_args.set_text(" " + " ".join(parts))
+
+    def apply_focused(self) -> bool:
+        role = self.focused_role()
+        return self.apply_role(role) if role else False
+
+    def apply_role(self, role: str) -> bool:
+        view = self.views.get(role)
+        if not view or not view.settings or not view.rows:
+            return False
+        args = self.command_args(role)
+        self.remembered[role] = dict(view.settings)
+        save_remembered(self.remembered)
+        name = DISPLAY_NAMES.get(role, role.upper())
+        self.close()
+        try:
+            subprocess.Popen(
+                ["sh", "-c", APPLY_WRAPPER, APPLIER_SCRIPT, name, role] + args,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                start_new_session=True,
+            )
+        except Exception as e:
+            print(f"Error applying display: {e}", file=sys.stderr)
+        return True
+
+    def apply_index(self, index: int) -> bool:
+        displays = (self.caps or {}).get("displays") or []
+        if not (0 <= index < len(displays)):
+            return False
+        role = displays[index].get("role")
+        return self.apply_role(role) if role else False
+
+    # ---------------------------------------------------------------- input --
 
     def on_key_press(self, widget, event):
         keyval = event.keyval
@@ -676,90 +757,41 @@ class DisplaySwitcher(Gtk.Window):
             return True
 
         if keyval in (Gdk.KEY_Return, Gdk.KEY_KP_Enter):
-            self.confirm()
-            return True
-
-        if keyval == Gdk.KEY_o and (event.state & Gdk.ModifierType.MOD4_MASK):
-            self.cycle()
+            if self.apply_focused():
+                return True
             self.reset_timer()
             return True
 
-        if keyval in (Gdk.KEY_Up, Gdk.KEY_k):
-            self.move(-1)
-            self.reset_timer()
-            return True
-
-        if keyval in (Gdk.KEY_Down, Gdk.KEY_j):
-            self.move(1)
-            self.reset_timer()
-            return True
-
-        if Gdk.KEY_1 <= keyval <= Gdk.KEY_9:
-            self.apply_row(keyval - Gdk.KEY_1)
-            return True
+        if keyval in (Gdk.KEY_Tab, Gdk.KEY_ISO_Left_Tab) or (
+            keyval == Gdk.KEY_o and (event.state & Gdk.ModifierType.MOD4_MASK)
+        ):
+            self.next_display()
+        elif keyval in (Gdk.KEY_Up, Gdk.KEY_k):
+            self.move_focus(-1)
+        elif keyval in (Gdk.KEY_Down, Gdk.KEY_j):
+            self.move_focus(1)
+        elif keyval in (Gdk.KEY_Left, Gdk.KEY_h):
+            self.change_value(-1)
+        elif keyval in (Gdk.KEY_Right, Gdk.KEY_l):
+            self.change_value(1)
+        elif keyval == Gdk.KEY_space:
+            self.toggle_value()
+        elif keyval in (Gdk.KEY_1, Gdk.KEY_2):
+            if self.apply_index(keyval - Gdk.KEY_1):
+                return True
 
         self.reset_timer()
         return True
 
     def on_cycle_signal(self, signum, frame):
-        GLib.idle_add(self._cycle_and_reset)
+        GLib.idle_add(self._next_display_and_reset)
 
-    def _cycle_and_reset(self):
-        self.cycle()
+    def _next_display_and_reset(self):
+        self.next_display()
         self.reset_timer()
         return False
 
-    def cycle(self):
-        self.move(1)
-
-    def move(self, delta: int):
-        """Move the selection by delta rows, skipping unavailable ones (wraps)."""
-        if not self.rows:
-            return
-        self.selection_interacted = True
-        count = len(self.rows)
-        for step in range(1, count + 1):
-            candidate = (self.selected_index + delta * step) % count
-            if self.is_available(candidate):
-                self.set_selected_index(candidate)
-                return
-
-    def set_selected_index(self, index: int):
-        self.rows[self.selected_index].set_selected(False)
-        self.selected_index = index
-        self.rows[self.selected_index].set_selected(True)
-        self.update_prompt()
-
-    def update_prompt(self):
-        self.prompt_mode.set_text(f" {ROWS[self.selected_index]['id']}")
-
-    def apply_row(self, index: int):
-        """Number-key shortcut: select and apply a row; unavailable rows do nothing."""
-        if not (0 <= index < len(self.rows)) or not self.is_available(index):
-            self.reset_timer()
-            return
-        self.selection_interacted = True
-        self.set_selected_index(index)
-        self.confirm()
-
-    def confirm(self):
-        if not self.rows:
-            return
-        if not self.is_available(self.selected_index):
-            self.reset_timer()
-            return
-        mode = ROWS[self.selected_index]
-        name = f"{mode['group_title']} · {mode['name']}"
-        self.close()
-        try:
-            subprocess.Popen(
-                ["sh", "-c", APPLY_WRAPPER, APPLIER_SCRIPT, mode["id"], name],
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-                start_new_session=True,
-            )
-        except Exception as e:
-            print(f"Error applying mode: {e}", file=sys.stderr)
+    # ---------------------------------------------------------------- timer --
 
     def reset_timer(self):
         self.remove_timer()
@@ -796,6 +828,288 @@ class DisplaySwitcher(Gtk.Window):
             GLib.source_remove(self.cursor_timer_id)
             self.cursor_timer_id = None
         Gtk.main_quit()
+
+    # ------------------------------------------------------------------ ui --
+
+    def build_ui(self):
+        self.set_name("display-switcher")
+
+        overlay = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
+        overlay.set_halign(Gtk.Align.FILL)
+        overlay.set_valign(Gtk.Align.FILL)
+
+        center = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL)
+        center.set_halign(Gtk.Align.CENTER)
+        center.set_valign(Gtk.Align.CENTER)
+
+        panel = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=12)
+        panel.set_name("terminal-panel")
+        panel.set_halign(Gtk.Align.CENTER)
+        panel.set_valign(Gtk.Align.CENTER)
+
+        header = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=12)
+        header.set_name("terminal-header")
+        title = chrome_label("DISPLAY SWITCHER", "header-title")
+        self.header_active = chrome_label("ACTIVE · NONE", "header-active")
+        self.header_active.set_xalign(1.0)
+        self.header_active.set_hexpand(True)
+        header.pack_start(title, False, False, 0)
+        header.pack_start(self.header_active, True, True, 0)
+
+        prompt_row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=0)
+        prompt_row.set_name("prompt-row")
+        prompt = Gtk.Label(label="$ display-apply.sh")
+        prompt.set_name("prompt-text")
+        prompt.set_xalign(0.0)
+        self.prompt_args = Gtk.Label(label="")
+        self.prompt_args.set_name("prompt-args")
+        self.prompt_args.set_xalign(0.0)
+        self.cursor = Gtk.Label(label="▌")
+        self.cursor.set_name("prompt-cursor")
+        self.cursor.set_xalign(0.0)
+        prompt_row.pack_start(prompt, False, False, 0)
+        prompt_row.pack_start(self.prompt_args, False, False, 0)
+        prompt_row.pack_start(self.cursor, False, False, 0)
+
+        self.label_size_group = Gtk.SizeGroup(mode=Gtk.SizeGroupMode.HORIZONTAL)
+        self.frames_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8)
+        self.frames_box.set_name("display-list")
+
+        footer = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=12)
+        footer.set_name("footer")
+        hints = Gtk.Label(
+            label="↑↓ select · ←→ change · space toggle · enter apply · tab next display · esc"
+        )
+        hints.set_name("footer-hints")
+        hints.set_xalign(0.0)
+        self.countdown = Gtk.Label(label="")
+        self.countdown.set_name("countdown")
+        self.countdown.set_xalign(1.0)
+        self.countdown.set_hexpand(True)
+        footer.pack_start(hints, False, False, 0)
+        footer.pack_end(self.countdown, True, True, 0)
+
+        panel.pack_start(header, False, False, 0)
+        panel.pack_start(prompt_row, False, False, 0)
+        panel.pack_start(self.frames_box, False, False, 0)
+        panel.pack_start(footer, False, False, 0)
+
+        center.pack_start(panel, False, False, 0)
+        overlay.pack_start(center, True, True, 0)
+        self.add(overlay)
+
+    def load_css(self):
+        css_provider = Gtk.CssProvider()
+        try:
+            if os.path.exists(CSS_FILE):
+                css_provider.load_from_path(CSS_FILE)
+            else:
+                css_provider.load_from_data(self.default_css().encode())
+            screen = Gdk.Screen.get_default()
+            if screen:
+                Gtk.StyleContext.add_provider_for_screen(
+                    screen, css_provider, Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION
+                )
+        except Exception as e:
+            print(f"CSS warning: {e}", file=sys.stderr)
+
+    def default_css(self) -> str:
+        return """
+/* display-switcher.css - Cold terminal theme */
+
+@define-color bg #060a0e;
+@define-color surface #0c1116;
+@define-color raised #141a21;
+@define-color line #2c3742;
+@define-color line_strong #505c69;
+@define-color fg #dde6ec;
+@define-color muted #95a0aa;
+@define-color faint #64707d;
+@define-color signal #7de2fa;
+@define-color bad #f47a7d;
+
+/* ── Backdrop ── */
+#display-switcher {
+    background: rgba(6, 10, 14, 0.85);
+}
+
+/* One monospace family everywhere; body size only, the prompt is the exception. */
+#display-switcher label {
+    font-family: "Martian Mono", "JetBrainsMono Nerd Font", "DejaVu Sans Mono", monospace;
+    font-size: 12px;
+}
+
+/* ── Panel ── */
+#terminal-panel {
+    background: @surface;
+    border: 1px solid @line;
+    border-radius: 0;
+    padding: 16px 20px;
+    min-width: 640px;
+}
+
+/* ── Chrome: uppercase, tracked caps (tracking is a Pango attr, see CHROME_TRACKING) ── */
+#display-switcher .chrome {
+    color: @muted;
+    font-weight: 600;
+}
+
+/* ── Header ── */
+#terminal-header {
+    border-bottom: 1px solid @line;
+    padding-bottom: 10px;
+}
+
+#header-active {
+    color: @muted;
+}
+
+/* ── Prompt (the one size step) ── */
+#prompt-row {
+    padding: 10px 0;
+}
+
+#display-switcher #prompt-text {
+    color: @fg;
+    font-size: 16px;
+    font-weight: 500;
+}
+
+#display-switcher #prompt-args {
+    color: @signal;
+    font-size: 16px;
+    font-weight: 600;
+}
+
+#display-switcher #prompt-cursor {
+    color: @signal;
+    font-size: 16px;
+    margin-left: 1px;
+}
+
+#display-switcher #prompt-cursor.off {
+    opacity: 0;
+}
+
+/* ── Display frames ── */
+#display-frame {
+    background: transparent;
+}
+
+#display-frame > border {
+    border: 1px solid @line_strong;
+    border-radius: 0;
+}
+
+#display-frame.focused > border {
+    border: 1px solid @signal;
+}
+
+#display-frame.disconnected > border {
+    border: 1px solid @line;
+}
+
+#display-frame.disconnected #legend-name {
+    color: @faint;
+}
+
+#frame-legend {
+    background: @surface;
+    padding: 0 6px;
+}
+
+#legend-name {
+    color: @muted;
+}
+
+#display-frame.focused #legend-name {
+    color: @signal;
+}
+
+#legend-device {
+    color: @faint;
+}
+
+#legend-note {
+    color: @faint;
+}
+
+#display-switcher #legend-tag {
+    background: @signal;
+    color: @bg;
+    padding: 1px 6px;
+}
+
+/* ── Frame body ── */
+#frame-body {
+    padding: 10px 12px;
+}
+
+#frame-note {
+    color: @faint;
+    font-size: 12px;
+    font-style: italic;
+    padding: 2px 4px;
+}
+
+#frame-note.error {
+    color: @bad;
+}
+
+/* ── Setting rows ── */
+#setting-row {
+    background: transparent;
+    border-left: 2px solid transparent;
+    padding: 3px 8px;
+}
+
+#setting-row.focused {
+    background: @raised;
+    border-left: 2px solid @signal;
+}
+
+#setting-label {
+    color: @muted;
+}
+
+#setting-row.focused #setting-label {
+    color: @signal;
+}
+
+#setting-value {
+    color: @fg;
+    font-size: 12px;
+    font-weight: 500;
+}
+
+#setting-row.focused #setting-value {
+    color: @signal;
+    font-weight: 600;
+}
+
+#setting-chevron {
+    color: @faint;
+    font-size: 12px;
+}
+
+/* ── Footer ── */
+#footer {
+    border-top: 1px solid @line;
+    padding-top: 10px;
+}
+
+#footer-hints {
+    color: @faint;
+    font-size: 12px;
+    font-style: italic;
+}
+
+#countdown {
+    color: @faint;
+    font-size: 12px;
+    font-style: italic;
+}
+"""
 
 
 def check_instance():
