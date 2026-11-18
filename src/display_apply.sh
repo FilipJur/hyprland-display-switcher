@@ -51,8 +51,9 @@ TV_DESC="desc:Philips Consumer Electronics Company Philips UHDTV 0x01010101"
 # that omits a key uses them.
 MON_DEF_RES="3440x1440" MON_DEF_HZ="74.98" MON_DEF_VRR=0 MON_DEF_HDR=0 MON_DEF_SCALE="1"
 TV_DEF_RES="3840x2160" TV_DEF_HZ="144" TV_DEF_VRR=1 TV_DEF_HDR=1 TV_DEF_SCALE="1.5"
-# Scale factors the overlay offers; preflight rejects anything else.
-SCALES="1 1.25 1.5 2"
+# Scale candidates; caps narrows them per resolution (Hyprland requires
+# W/scale and H/scale to be integral, otherwise it rounds and errors).
+SCALE_CANDIDATES="1 1.25 1.5 1.6 1.75 2"
 
 # Color bases: role + hdr decides bit depth, preset and HDR metadata. The tv
 # HDR base carries the calibrated SDR-to-HDR mapping. Monitor HDR is not a
@@ -83,6 +84,11 @@ REQ_ROLE="" REQ_RES="" REQ_W="" REQ_H="" REQ_HZ="" REQ_VRR="" REQ_HDR="" REQ_SCA
 REQ_BITDEPTH="" REQ_CM=""
 # One cached `modetest -c` dump per run (read-only connector properties).
 MODETEST_OUT="" MODETEST_TRIED=0
+# Fresh DRM ground-truth view for the final verification (see drm_observe).
+DRM_C="" DRM_E="" DRM_P=""
+DRM_OBS="" DRM_WHY="" DRM_SKIP_LOGGED=0
+DRM_ENC="" DRM_ST="" DRM_CS="" DRM_EOTF="" DRM_CRTC=""
+DRM_MW="" DRM_MH="" DRM_MHZ="" DRM_VRR=""
 
 # ------------------------------------------------------------------- logging --
 
@@ -261,6 +267,16 @@ color_kv() { # color_kv <role> <hdr> <key> → value from that color base
   return 1
 }
 
+scale_valid() { # scale_valid <w> <h> <scale:0-2dp> → 0 when W/scale and H/scale are integral
+  # Hyprland (Monitor.cpp) rounds a scale whose logical size is fractional;
+  # compare as exact hundredths so 1.6 counts as 160/100.
+  awk -v w="$1" -v h="$2" -v s="$3" 'BEGIN {
+    s100 = int(s * 100 + 0.5)
+    if (s100 <= 0) exit 1
+    exit !(((w * 100) % s100 == 0) && ((h * 100) % s100 == 0))
+  }'
+}
+
 custom_modeline() { # custom_modeline <res> <hz> → monitor-only custom modeline
   if [[ "$1" == "1920x1080" ]] && refresh_close "$2" "$CS2_HZ"; then
     printf '%s' "$CS2_MODELINE"
@@ -387,10 +403,12 @@ preflight_request() { # validate REQ_* before any write; exit 3 on failure
   local role="$REQ_ROLE" conn s ok
   conn=$(role_conn "$role")
   ok=0
-  for s in $SCALES; do
+  for s in $SCALE_CANDIDATES; do
     if num_close "$REQ_SCALE" "$s"; then ok=1; break; fi
   done
-  (( ok )) || die 3 "scale $REQ_SCALE is not supported (allowed: $SCALES)"
+  (( ok )) || die 3 "scale $REQ_SCALE is not supported (allowed: $SCALE_CANDIDATES)"
+  scale_valid "$REQ_W" "$REQ_H" "$REQ_SCALE" ||
+    die 3 "scale $REQ_SCALE gives a fractional logical size at ${REQ_W}x${REQ_H}"
   if [[ "$role" == monitor ]] && custom_modeline "$REQ_RES" "$REQ_HZ" >/dev/null; then
     :
   elif mode_advertised "$(role_json "$role")" "$REQ_W" "$REQ_H" "$REQ_HZ"; then
@@ -430,7 +448,12 @@ emit_block() { # emit_block <role> <selector> <position-override> <disabled 0|1>
       *) die 4 "internal error: unknown color key '$k'" ;;
     esac
   done
-  printf '    vrr = %s\n' "$(setting "$role" vrr)"
+  # No per-monitor vrr here on purpose: Hyprland 0.56.2's CMonitorRule::compare()
+  # ignores vrr, so a vrr-only change is a FULL_MATCH and the monitor rule is
+  # not re-applied; the stale per-monitor value would then override misc:vrr in
+  # ensureVRR(). Exactly one display is active at a time, so the global
+  # misc:vrr (written above, reasserted after each reload) is the per-display
+  # VRR control.
   (( dis )) && printf '    disabled = 1\n'
   printf '}\n'
 }
@@ -475,6 +498,117 @@ num_close() { awk -v a="$1" -v b="$2" 'BEGIN { exit !(a == b) }'; }
 
 refresh_close() { # |got - want| <= 0.1
   awk -v a="$1" -v b="$2" 'BEGIN { d = a - b; if (d < 0) d = -d; exit !(d <= 0.1) }'
+}
+
+# DRM ground truth: what the kernel is actually driving, read from modetest.
+# Used by the final verification because Hyprland's view can lag or disagree
+# with the DRM state. Any probe/parse failure is a skip, never a failure.
+
+drm_connector_info() { # <connector> → "encoder|status|colorspace|eotf-hex"
+  awk -v want="$1" '
+    BEGIN { found = 0; prop = ""; inval = 0; enc = ""; st = ""; cs = ""; blob = "" }
+    $3 == "connected" || $3 == "disconnected" {
+      if ($4 == want) { found = 1; enc = $2; st = $3; prop = ""; inval = 0 }
+      else if (found) exit
+      next
+    }
+    !found { next }
+    $1 ~ /^[0-9]+$/ && $2 ~ /:$/ {
+      prop = $2
+      sub(/:$/, "", prop)
+      inval = (prop == "HDR_OUTPUT_METADATA")
+      next
+    }
+    prop == "Colorspace" && $1 == "value:" { cs = $2; next }
+    inval && $1 == "value:" && $2 != "" { blob = $2; next }
+    inval && $1 ~ /^[0-9a-fA-F]+$/ { blob = blob $1; next }
+    END {
+      if (!found) exit 1
+      eotf = ""
+      # struct hdr_output_metadata: byte 0-3 metadata type, byte 4 eotf (PQ = 0x02).
+      if (blob != "") eotf = tolower(substr(blob, 9, 2))
+      printf "%s|%s|%s|%s\n", enc, st, cs, eotf
+    }
+  ' <<<"$DRM_C"
+}
+
+drm_crtc_for_encoder() { # <encoder-id> → crtc id (empty when unmapped)
+  awk -v want="$1" '
+    /^Encoders:/ { ins = 1; next }
+    ins && $1 ~ /^[0-9]+$/ && $1 == want { print $2; exit }
+  ' <<<"$DRM_E"
+}
+
+drm_crtc_state() { # <crtc-id> → "W H REFRESH VRR_ENABLED"
+  awk -v want="$1" '
+    BEGIN { insec = 0; incrtc = 0; mw = ""; mh = ""; mhz = ""; vrr = ""; invrr = 0 }
+    /^CRTCs:/ { insec = 1; next }
+    /^Planes:/ { insec = 0; next }
+    !insec { next }
+    $1 ~ /^[0-9]+$/ && $2 ~ /^[0-9]+$/ && $3 ~ /^\(/ { incrtc = ($1 == want); next }
+    incrtc && $1 == "#0" && $2 ~ /^[0-9]+x[0-9]+(@[0-9.]+)?$/ {
+      # User-defined modes carry a name like 1920x1080@74; WxH is before '@'.
+      name = $2
+      sub(/@.*/, "", name)
+      split(name, a, "x"); mw = a[1]; mh = a[2]; mhz = $3; next
+    }
+    incrtc && $1 ~ /^[0-9]+$/ && $2 == "VRR_ENABLED:" { invrr = 1; next }
+    incrtc && invrr && $1 == "value:" { vrr = $2; invrr = 0; next }
+    END {
+      if (mw == "" || vrr == "") exit 1
+      printf "%s %s %s %s\n", mw, mh, mhz, vrr
+    }
+  ' <<<"$DRM_P"
+}
+
+drm_observe() { # drm_observe <connector>: fresh DRM view → DRM_*; 0 parsed, 2 skipped
+  local conn="$1" info state
+  DRM_OBS=""; DRM_WHY=""
+  DRM_ENC="" DRM_ST="" DRM_CS="" DRM_EOTF="" DRM_CRTC=""
+  DRM_MW="" DRM_MH="" DRM_MHZ="" DRM_VRR=""
+  command -v modetest >/dev/null 2>&1 || { DRM_WHY="modetest not installed"; return 2; }
+  DRM_C=$(timeout 10 modetest -c 2>/dev/null) || DRM_C=""
+  DRM_E=$(timeout 10 modetest -e 2>/dev/null) || DRM_E=""
+  [[ -n "$DRM_C" && -n "$DRM_E" ]] || { DRM_WHY="modetest -c/-e failed"; return 2; }
+  info=$(drm_connector_info "$conn") || { DRM_WHY="connector $conn not found in modetest -c"; return 2; }
+  IFS='|' read -r DRM_ENC DRM_ST DRM_CS DRM_EOTF <<<"$info"
+  DRM_CRTC=$(drm_crtc_for_encoder "$DRM_ENC")
+  DRM_OBS="$conn: enc=${DRM_ENC:-none} crtc=${DRM_CRTC:-none} status=${DRM_ST:-unknown}"
+  [[ "$DRM_ST" == connected ]] || return 0
+  [[ -n "$DRM_CRTC" && "$DRM_CRTC" != 0 ]] || { DRM_OBS+=" (no active CRTC)"; return 0; }
+  DRM_P=$(timeout 10 modetest -p 2>/dev/null) || DRM_P=""
+  [[ -n "$DRM_P" ]] || { DRM_WHY="modetest -p failed"; return 2; }
+  state=$(drm_crtc_state "$DRM_CRTC") || { DRM_WHY="CRTC $DRM_CRTC not parseable in modetest -p"; return 2; }
+  IFS=' ' read -r DRM_MW DRM_MH DRM_MHZ DRM_VRR <<<"$state"
+  DRM_OBS+=" mode=${DRM_MW}x${DRM_MH}@${DRM_MHZ} VRR_ENABLED=$DRM_VRR Colorspace=${DRM_CS:-none} HDR_eotf=${DRM_EOTF:-none}"
+  [[ -n "$DRM_CS" ]] || { DRM_WHY="connector $conn has no Colorspace property"; return 2; }
+  return 0
+}
+
+drm_check() { # drm_check <conn> <w> <h> <hz> <vrr 0|1> <hdr 0|1>; 1 with VT_WHY on mismatch
+  local conn="$1" w="$2" h="$3" hz="$4" wvrr="$5" whdr="$6"
+  drm_observe "$conn"
+  (( $? == 0 )) || return 0   # skipped: rely on the Hyprland-level checks
+  if [[ "$DRM_ST" != connected ]]; then
+    VT_WHY="DRM connector $conn is ${DRM_ST:-unknown}"
+    return 1
+  fi
+  if [[ -z "$DRM_CRTC" || "$DRM_CRTC" == 0 ]]; then
+    VT_WHY="DRM connector $conn has no CRTC"
+    return 1
+  fi
+  (( DRM_MW == w && DRM_MH == h )) || { VT_WHY="DRM mode ${DRM_MW}x${DRM_MH} != ${w}x${h}"; return 1; }
+  refresh_close "$DRM_MHZ" "$hz" || { VT_WHY="DRM refresh $DRM_MHZ not within 0.1 Hz of $hz"; return 1; }
+  [[ "$DRM_VRR" == "$wvrr" ]] || { VT_WHY="DRM VRR_ENABLED=$DRM_VRR != $wvrr"; return 1; }
+  if (( whdr )); then
+    [[ "$DRM_CS" == 9 ]] || { VT_WHY="DRM Colorspace=$DRM_CS != 9 (BT2020_RGB)"; return 1; }
+    [[ -n "$DRM_EOTF" ]] || { VT_WHY="DRM HDR_OUTPUT_METADATA missing (want eotf 0x02)"; return 1; }
+    [[ "$DRM_EOTF" == 02 ]] || { VT_WHY="DRM HDR_OUTPUT_METADATA eotf=0x$DRM_EOTF != 0x02"; return 1; }
+  else
+    [[ "$DRM_CS" == 0 ]] || { VT_WHY="DRM Colorspace=$DRM_CS != 0 (Default)"; return 1; }
+    [[ -z "$DRM_EOTF" || "$DRM_EOTF" == 00 ]] || { VT_WHY="DRM HDR_OUTPUT_METADATA eotf=0x$DRM_EOTF != 0x00"; return 1; }
+  fi
+  return 0
 }
 
 get_option_val() { # live int value of a keyword through IPC
@@ -524,9 +658,9 @@ verify_target() { # verify_target <role> <snapshot-json>; sets VT_WHY/VT_OBS
   [[ "$vrr" == "$want_vrr" ]] || { VT_WHY="vrr $vrr != $want_vrr"; return 1; }
   return 0
 }
-verify_final() { # verify_final <role> <snapshot-json>: request + non-target off + global prefs
+verify_final() { # verify_final <role> <snapshot-json>: request + non-target off + globals + DRM
   verify_target "$@" || return 1
-  local role="$1" oarr on odis hdr want vrr
+  local role="$1" oarr on odis hdr want vrr conn
   oarr=$(role_match "$(other "$role")" "$2") || { VT_WHY="non-target query failed"; return 1; }
   on=$(jq 'length' <<<"$oarr")
   if (( on > 0 )); then
@@ -537,6 +671,14 @@ verify_final() { # verify_final <role> <snapshot-json>: request + non-target off
   (( hdr == REQ_HDR )) || { VT_WHY="quirks:prefer_hdr=$hdr != $REQ_HDR"; return 1; }
   vrr=$(get_misc_vrr) || { VT_WHY="misc:vrr unreadable"; return 1; }
   (( vrr == REQ_VRR )) || { VT_WHY="misc:vrr=$vrr != $REQ_VRR"; return 1; }
+  # Ground truth: the kernel's DRM state must match the request as well. A
+  # missing/failing modetest only logs once and never blocks the apply.
+  conn=$(role_conn "$role")
+  drm_check "$conn" "$REQ_W" "$REQ_H" "$REQ_HZ" "$REQ_VRR" "$REQ_HDR" || return 1
+  if [[ -n "$DRM_WHY" && "$DRM_SKIP_LOGGED" == 0 ]]; then
+    log "DRM check skipped: $DRM_WHY"
+    DRM_SKIP_LOGGED=1
+  fi
   return 0
 }
 
@@ -677,6 +819,13 @@ report_observed() { # full observed state after a failed verification
     log "observed state:"
     log "  $(obs_role monitor "$json")"
     log "  $(obs_role tv "$json")"
+    if [[ -n "${TGT_CONN:-}" ]]; then
+      if drm_observe "$TGT_CONN"; then
+        log "  DRM ${DRM_OBS}"
+      else
+        log "  DRM unavailable: ${DRM_WHY}"
+      fi
+    fi
   fi
   local hdr vrr
   hdr=$(get_prefer_hdr || true)
@@ -773,8 +922,10 @@ ensure_flow() { # ensure_flow — caller holds the lock
 
 # -------------------------------------------------------------------- caps ---
 
-modes_json() { # modes_json <availableModes> <extra-rates> <def-res> <def-hz>
-  jq -c --argjson extra "$2" --arg dres "$3" --argjson dhz "$4" '
+modes_json() { # modes_json <availableModes> <extra-rates> <def-res> <def-hz> <scale-candidates>
+  # modes[].scales mirrors scale_valid(): candidates whose logical size is
+  # integral in both dimensions (Hyprland rounds/errors otherwise).
+  jq -c --argjson extra "$2" --arg dres "$3" --argjson dhz "$4" --arg scales "$5" '
     ( [ .[]?
         | capture("^(?<res>[0-9]+x[0-9]+)@(?<hz>[0-9.]+)Hz$")
         | {res, hz: (((.hz | tonumber) * 100 | round) / 100)}
@@ -789,6 +940,12 @@ modes_json() { # modes_json <availableModes> <extra-rates> <def-res> <def-hz>
           group_by(.hz)
           | map((([.[] | select(has("custom"))][0]) // .[0]) | del(.res))
           | sort_by(-.hz)
+        ),
+        scales: (
+          (.[0].res | split("x") | map(tonumber)) as $d
+          | [ $scales | split(" ") | map(tonumber) | .[]
+              | select((((. * 100) | round) as $s100
+                        | (($d[0] * 100) % $s100 == 0) and (($d[1] * 100) % $s100 == 0))) ]
         )
       })
     | sort_by(.res | split("x") | map(tonumber) | (.[0] * .[1]))
@@ -811,7 +968,7 @@ display_caps_json() { # display_caps_json <role> → one caps display object
       extras=$(printf '[{"res":"1920x1080","hz":%s,"custom":"cs2"},{"res":"2560x1440","hz":%s,"custom":"cs2-2k"}]' "$CS2_HZ" "$CS2_2K_HZ")
     fi
     modes=$(modes_json "$(jq -c '.[0].availableModes // []' <<<"$arr")" \
-      "$extras" "$(default_setting "$role" res)" "$(default_setting "$role" hz)")
+      "$extras" "$(default_setting "$role" res)" "$(default_setting "$role" hz)" "$SCALE_CANDIDATES")
     if (( enabled )); then
       current=$(jq -c '.[0] | {
         res: "\(.width)x\(.height)",
@@ -839,7 +996,6 @@ display_caps_json() { # display_caps_json <role> → one caps display object
     --argjson hdr "$hdr" \
     --argjson modes "$modes" \
     --argjson current "$current" \
-    --arg scales "$SCALES" \
     --arg dres "$(default_setting "$role" res)" \
     --argjson dhz "$(default_setting "$role" hz)" \
     --argjson dvrr "$([[ "$(default_setting "$role" vrr)" == 1 ]] && echo true || echo false)" \
@@ -855,7 +1011,6 @@ display_caps_json() { # display_caps_json <role> → one caps display object
       vrr_capable: $vrr,
       hdr_capable: $hdr,
       modes: $modes,
-      scales: ($scales | split(" ") | map(tonumber)),
       defaults: {res: $dres, hz: $dhz, vrr: $dvrr, hdr: $dhdr, scale: $dscale},
       current: $current
     }'

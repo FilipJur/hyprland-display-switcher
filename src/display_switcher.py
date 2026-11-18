@@ -429,7 +429,10 @@ class DisplaySwitcher(Gtk.Window):
             keys.append(("vrr", "VRR", False))
         if display.get("hdr_capable"):
             keys.append(("hdr", "HDR", False))
-        if display.get("scales"):
+        if any(
+            self._scales_for(display, mode.get("res"))
+            for mode in display.get("modes") or []
+        ):
             keys.append(("scale", "SCALE", True))
         for key, label, choices in keys:
             view.add_row(key, label, choices, self.label_size_group)
@@ -449,9 +452,8 @@ class DisplaySwitcher(Gtk.Window):
                 return settings
         return self.fallback_settings(display)
 
-    @staticmethod
     def sanitize_settings(
-        display: Dict[str, Any], candidate: Any
+        self, display: Dict[str, Any], candidate: Any
     ) -> Optional[Dict[str, Any]]:
         if not isinstance(candidate, dict):
             return None
@@ -473,7 +475,7 @@ class DisplaySwitcher(Gtk.Window):
         scale = candidate.get("scale")
         if not isinstance(scale, (int, float)):
             return None
-        scales = display.get("scales") or []
+        scales = self._scales_for(display, res)
         matched_scale = next((s for s in scales if abs(s - scale) <= 0.001), None)
         if matched_scale is None:
             return None
@@ -485,17 +487,17 @@ class DisplaySwitcher(Gtk.Window):
             "scale": matched_scale,
         }
 
-    @staticmethod
-    def fallback_settings(display: Dict[str, Any]) -> Dict[str, Any]:
+    def fallback_settings(self, display: Dict[str, Any]) -> Dict[str, Any]:
         modes = display.get("modes") or []
+        res = modes[0]["res"] if modes else ""
         rates = (modes[0].get("rates") or []) if modes else []
-        scales = display.get("scales") or [1]
+        scales = self._scales_for(display, res)
         return {
-            "res": modes[0]["res"] if modes else "",
+            "res": res,
             "hz": rates[0]["hz"] if rates else 0.0,
             "vrr": False,
             "hdr": False,
-            "scale": scales[0],
+            "scale": scales[0] if scales else 1,
         }
 
     @staticmethod
@@ -504,6 +506,17 @@ class DisplaySwitcher(Gtk.Window):
             if mode.get("res") == res:
                 return mode.get("rates") or []
         return []
+
+    @staticmethod
+    def _scales_for(display: Dict[str, Any], res: str) -> List[float]:
+        for mode in display.get("modes") or []:
+            if mode.get("res") == res:
+                return mode.get("scales") or []
+        return []
+
+    @staticmethod
+    def _nearest_scale(scales: List[float], target: float) -> float:
+        return min(scales, key=lambda scale: (abs(scale - target), scale))
 
     @classmethod
     def _rate_for(
@@ -653,6 +666,10 @@ class DisplaySwitcher(Gtk.Window):
         keep = self._rate_for(display, new_res, settings.get("hz", 0))
         settings["res"] = new_res
         settings["hz"] = keep["hz"] if keep else rates[0]["hz"]
+        scales = self._scales_for(display, new_res)
+        current_scale = settings.get("scale", 0)
+        if scales and not any(abs(s - current_scale) <= 0.001 for s in scales):
+            settings["scale"] = self._nearest_scale(scales, current_scale)
 
     def cycle_refresh(
         self, display: Dict[str, Any], settings: Dict[str, Any], delta: int
@@ -673,7 +690,7 @@ class DisplaySwitcher(Gtk.Window):
     def cycle_scale(
         self, display: Dict[str, Any], settings: Dict[str, Any], delta: int
     ):
-        scales = display.get("scales") or []
+        scales = self._scales_for(display, settings.get("res"))
         if not scales:
             return
         index = next(
