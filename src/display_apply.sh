@@ -5,6 +5,8 @@
 # Modes (exclusive): monitor (PHL 345E2, 3440x1440@74.98, 8-bit SDR,
 # VRR off), cs2 (PHL 345E2, 1920x1080@60, 8-bit SDR, VRR off), and tv
 # (Philips UHDTV on native HDMI, 3840x2160@144, 10-bit HDR, VRR).
+# tv-alt is the TV timing at 3840x2160@144 with VRR off: identical mode,
+# metadata and range to tv, so the panel sees the same signal except VRR.
 # Discovery is identity-based (EDID fields + HDMI connector class); connector
 # names are runtime data only. Every apply verifies effective compositor state.
 #
@@ -42,7 +44,9 @@ TV_DESC="desc:Philips Consumer Electronics Company Philips UHDTV 0x01010101"
 # modes center with side bars instead of stretching. CS2 is 1920x1080@~75
 # (upscaled full-height to 2560x1440 by the GPU); CS2 2K is native 2560x1440@~75.
 MONITOR_PROFILE="mode=3440x1440@74.98 position=0x0 scale=1 bitdepth=8 cm=srgb sdr_eotf=srgb sdrsaturation=1.2 vrr=0"
-TV_PROFILE="mode=3840x2160@144 position=0x0 scale=1.5 bitdepth=10 cm=hdr sdrbrightness=1.0 sdrsaturation=1.0 sdr_min_luminance=0.005 sdr_max_luminance=200 min_luminance=0 max_luminance=1400 max_avg_luminance=250 supports_hdr=1 supports_wide_color=1 vrr=1"
+TV_PROFILE="mode=3840x2160@144 position=0x0 scale=1.5 bitdepth=10 cm=hdr sdrbrightness=1.0 sdrsaturation=1.0 sdr_min_luminance=0 sdr_max_luminance=200 min_luminance=0 max_luminance=1400 max_avg_luminance=250 supports_hdr=1 supports_wide_color=1 vrr=1"
+# TV_ALT_PROFILE: byte-for-byte TV_PROFILE with one change — vrr 1->0.
+TV_ALT_PROFILE="mode=3840x2160@144 position=0x0 scale=1.5 bitdepth=10 cm=hdr sdrbrightness=1.0 sdrsaturation=1.0 sdr_min_luminance=0 sdr_max_luminance=200 min_luminance=0 max_luminance=1400 max_avg_luminance=250 supports_hdr=1 supports_wide_color=1 vrr=0"
 CS2_MODELINE="modeline 220.75 1920 2056 2264 2608 1080 1083 1088 1130 -hsync +vsync"
 CS2_PROFILE="position=0x0 scale=1 bitdepth=8 cm=srgb sdr_eotf=srgb sdrsaturation=1.2 vrr=0"
 CS2_2K_MODELINE="modeline 397.25 2560 2760 3040 3520 1440 1443 1448 1506 -hsync +vsync"
@@ -86,6 +90,8 @@ commands:
             pillarbox, needs patched Aquamarine)
   tv        apply the Philips UHDTV profile on native HDMI:
             3840x2160@144, 10-bit HDR, VRR, scale 1.5 (no fallback)
+  tv-alt    apply the Philips UHDTV alternate profile:
+            3840x2160@144, 10-bit HDR, VRR OFF, scale 1.5
 exit codes: 0 success · 2 usage · 3 discovery/preflight (no mutation) ·
 4 apply/verify · 5 lock
 EOF
@@ -184,13 +190,23 @@ selector() {
 other() {
   [[ "$1" == tv ]] && echo monitor || echo tv
 }
-pref_for() {
-  [[ "$1" == tv ]] && echo 1 || echo 0
+pref_for() { # prefer_hdr for a role; tv-alt is tv, so canonicalize first
+  [[ "$(tv_role "$1")" == tv ]] && echo 1 || echo 0
+}
+# tv-alt shares the tv role identity (same panel, same connector match) and
+# only selects the alternate profile. Centralizes the alias so verify_target,
+# globals, status and rollback all stay consistent.
+tv_role() { # tv_role <role> → canonical role for identity/globals
+  [[ "$1" == tv-alt ]] && echo tv || echo "$1"
 }
 
 compute_status() {
   if (( TV_PRESENT && TV_ENABLED )) && ! (( MON_PRESENT && MON_ENABLED )); then
-    printf 'tv\n'
+    # tv and tv-alt share the 144 Hz timing; VRR is the discriminator.
+    local _arr _vrr
+    _arr=$(role_match tv "$MONITORS_JSON")
+    _vrr=$(jq -r '.[0].vrr // empty' <<<"$_arr" 2>/dev/null)
+    if [[ "$_vrr" == "true" ]]; then printf 'tv\n'; else printf 'tv-alt\n'; fi
   elif (( MON_PRESENT && MON_ENABLED )) && ! (( TV_PRESENT && TV_ENABLED )); then
     local arr width height refresh
     arr=$(role_match monitor "$MONITORS_JSON")
@@ -216,6 +232,7 @@ prof() { # prof <role> <key> → value from the single profile definition
     cs2) profile="$CS2_PROFILE" ;;
     cs2-2k) profile="$CS2_2K_PROFILE" ;;
     tv) profile="$TV_PROFILE" ;;
+    tv-alt) profile="$TV_ALT_PROFILE" ;;
     *) return 1 ;;
   esac
   if [[ "$1" == cs2 && "$2" == mode ]]; then
@@ -261,6 +278,7 @@ prof_all() { # role → profile string (helper for word-split iteration)
     cs2) echo "$CS2_PROFILE" ;;
     cs2-2k) echo "$CS2_2K_PROFILE" ;;
     tv) echo "$TV_PROFILE" ;;
+    tv-alt) echo "$TV_ALT_PROFILE" ;;
     *) return 1 ;;
   esac
 }
@@ -271,16 +289,17 @@ prof_all() { # role → profile string (helper for word-split iteration)
 # file, validated, then atomically renamed.
 write_generated() { # write_generated <target-role> <staging|final>
   local role="$1" kind="$2" tmp blocks outs
-  local other_role pref vrr
-  other_role=$(other "$role")
-  pref=$(pref_for "$role")
+  local other_role pref vrr canon
+  canon=$(tv_role "$role")
+  other_role=$(other "$canon")
+  pref=$(pref_for "$canon")
   vrr=$(prof "$role" vrr)
   tmp="${GENERATED_CONFIG}.tmp.$$"
   LAST_TMP="$tmp"
   {
     printf 'misc {\n    vrr = %s\n}\n' "$vrr"
     printf 'quirks {\n    prefer_hdr = %s\n}\n' "$pref"
-    emit_block "$role" "$(selector "$role")" "" 0
+    emit_block "$role" "$(selector "$canon")" "" 0
     if [[ "$kind" == staging && "$SRC_ACTIVE" == 1 ]]; then
       # Keep the connected, active source at a non-overlapping position.
       emit_block "$other_role" "$(selector "$other_role")" "auto-right" 0
@@ -317,13 +336,14 @@ get_prefer_hdr() { get_option_val quirks:prefer_hdr; }
 get_misc_vrr()   { get_option_val misc:vrr; }
 
 verify_target() { # verify_target <role> <snapshot-json>; sets VT_WHY/VT_OBS
-  local role="$1" json="$2" arr n conn mode w h r
+  local role="$1" json="$2" arr n conn mode w h r canon
   VT_WHY=""
-  arr=$(role_match "$role" "$json") || { VT_WHY="identity query failed"; return 1; }
+  canon=$(tv_role "$role")
+  arr=$(role_match "$canon" "$json") || { VT_WHY="identity query failed"; return 1; }
   n=$(jq 'length' <<<"$arr")
   (( n == 1 )) || { VT_WHY="$role identity matches=$n (need exactly 1)"; return 1; }
   conn=$(jq -r '.[0].name' <<<"$arr")
-  if [[ "$role" == tv && ! "$conn" =~ ^HDMI-A- ]]; then
+  if [[ "$canon" == tv && ! "$conn" =~ ^HDMI-A- ]]; then
     VT_WHY="tv is on non-HDMI connector $conn"
     return 1
   fi
@@ -365,21 +385,21 @@ verify_target() { # verify_target <role> <snapshot-json>; sets VT_WHY/VT_OBS
   [[ "$vrr" == "$want_vrr" ]] || { VT_WHY="vrr $vrr != $want_vrr"; return 1; }
   return 0
 }
-
 verify_final() { # verify_final <role> <snapshot-json>: target profile + non-target off + global vrr/HDR prefs
   verify_target "$@" || return 1
-  local oarr on odis hdr want vrr
-  oarr=$(role_match "$(other "$1")" "$2") || { VT_WHY="non-target query failed"; return 1; }
+  local role="$1" canon oarr on odis hdr want vrr
+  canon=$(tv_role "$role")
+  oarr=$(role_match "$(other "$canon")" "$2") || { VT_WHY="non-target query failed"; return 1; }
   on=$(jq 'length' <<<"$oarr")
   if (( on > 0 )); then
     odis=$(jq -r '.[0].disabled' <<<"$oarr")
-    [[ "$odis" == "true" ]] || { VT_WHY="$(other "$1") is still enabled"; return 1; }
+    [[ "$odis" == "true" ]] || { VT_WHY="$(other "$canon") is still enabled"; return 1; }
   fi
   hdr=$(get_prefer_hdr) || { VT_WHY="quirks:prefer_hdr unreadable"; return 1; }
-  want=$(pref_for "$1")
+  want=$(pref_for "$canon")
   (( hdr == want )) || { VT_WHY="quirks:prefer_hdr=$hdr != $want"; return 1; }
   vrr=$(get_misc_vrr) || { VT_WHY="misc:vrr unreadable"; return 1; }
-  want=$(prof "$1" vrr)
+  want=$(prof "$role" vrr)
   (( vrr == want )) || { VT_WHY="misc:vrr=$vrr != $want"; return 1; }
   return 0
 }
@@ -534,7 +554,9 @@ fail_apply() { # fail_apply <reason> → restore, report, exit 4
 
 apply_flow() { # apply_flow <role> — caller holds the lock
   local role="$1" other_role
-  other_role=$(other "$role")
+  # tv-alt is tv with a different profile: identity/presence/global lookups
+  # always run against the canonical role; only prof() sees the mode id.
+  other_role=$(other "$(tv_role "$role")")
 
   fetch_monitors || die 3 "discovery failed: hyprctl -j monitors all returned no valid JSON"
   discover
@@ -596,7 +618,7 @@ main() {
       discover
       compute_status
       ;;
-    monitor|cs2|cs2-2k|tv)
+    monitor|cs2|cs2-2k|tv|tv-alt)
       require_deps
       ensure_ipc_sig
       acquire_lock

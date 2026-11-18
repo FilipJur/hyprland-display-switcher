@@ -69,7 +69,7 @@ The TV is disabled in the final monitor profile.
 | Scale | `1.5` |
 | Bit depth | `10` |
 | Color preset | `hdr` |
-| SDR brightness | `1.0` |
+| SDR brightness | `3.0` |
 | SDR saturation | `1.0` |
 | SDR minimum luminance | `0.005` |
 | SDR maximum luminance | `200` |
@@ -84,6 +84,8 @@ The TV is disabled in the final monitor profile.
 The desktop monitor is disabled in the final TV profile.
 
 The color and scale values above preserve the last intentional project tuning. Changing those values is a separate calibration decision, not part of the HDMI transport refactor.
+
+SDR brightness is calibrated at `3.0` (Hyprland default `1.0`; `1.0 → 2.0 → 2.5 → 3.0` over the 2026-10-02 desktop-brightness tuning, with `5.0` tried and rejected as blown out): it lifts SDR white in HDR mode, which is this panel's only desktop-brightness lever (no backlight sysfs node, and the Philips UHDTV does not answer DDC/CI at `0x37`, so neither `brightnessctl` nor `ddcutil` can drive the panel) and, as a side effect, pushes VRR flicker on dark desktop content below the panel's visible gamma-wobble region. `3.0` puts SDR reference white at 600 cd/m² (`3.0 × sdr_max_luminance=200`); above that SDR highlights visibly clip, so treat `3.0` as the practical ceiling for this profile and change it in ≤`0.25` steps. Source audit of Hyprland 0.56.2: `CMonitorRuleParser::parseSDRBrightness` accepts any float — no range check, no clamp — and the only consumers are the color-management shader's `sdrBrightnessMultiplier` multiply and the SDR→HDR modifier gate, so this value alone cannot abort the compositor. The 2026-05-03 SIGABRT previously attributed to `2.0` was applied together with `cm = hdredid` plus explicit luminance overrides, both dropped later that evening; the current TV profile is `cm = hdr` with EDID-controlled luminance. `TV_ALT_PROFILE` must carry the same value so `tv` and `tv-alt` differ only in VRR.
 
 ## Component Boundaries
 

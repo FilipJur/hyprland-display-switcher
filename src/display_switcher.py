@@ -46,6 +46,12 @@ MODES: List[Dict[str, Any]] = [
         "icon": "tv-symbolic",
         "desc": "4K · 144 Hz · HDR · VRR",
     },
+    {
+        "id": "tv-alt",
+        "name": "TV Alt",
+        "icon": "tv-symbolic",
+        "desc": "4K · 144 Hz · HDR · no VRR",
+    },
 ]
 
 
@@ -202,7 +208,7 @@ class DisplaySwitcher(Gtk.Window):
         return False
 
     def set_current_mode(self, mode: str):
-        if mode not in {"monitor", "cs2", "cs2-2k", "tv"}:
+        if mode not in {"monitor", "cs2", "cs2-2k", "tv", "tv-alt"}:
             mode = "unknown"
         self.current_mode = mode
 
