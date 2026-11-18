@@ -117,16 +117,19 @@ flowchart LR
 
 ### `src/display_switcher.py`: presentation only
 
-Terminal-style panel: monospace text, warm dark background, single cyan accent.
+Terminal-style panel in IBM Plex Mono (installed user-level in `~/.local/share/fonts`; fallbacks JetBrainsMono Nerd Font, then DejaVu Sans Mono) on a warm dark background with a single cyan accent.
 
 Responsibilities:
 
-- Header with the active mode and a `$ display-apply.sh` prompt with a blinking cursor.
-- One row per mode — `monitor`, `cs2`, `tv`, `tv-alt` — with device/spec columns and a `● active` or `not connected` tag. `cs2-2k` is applier-only and has no row.
+- Header `Display switcher` plus `active: <Group> · <mode>`, and a `$ display-apply.sh <selected mode id>` prompt with a blinking cursor.
+- Group modes by display under uppercase headings with device and connector, and a group-level `not connected` marker:
+  - `MONITOR` (PHL 345E2 · DP): Desktop (`monitor`), CS2 (`cs2`).
+  - `TV` (Philips UHDTV · HDMI): HDR · VRR (`tv`), HDR, VRR off (`tv-alt`).
+- Number the rows 1–4 for the digit keys, tag the active row `● active`, and dim and skip every row of a disconnected display.
+- Footer: `↑↓ move · 1–4 jump · enter apply · esc cancel`, plus a 3 s auto-close countdown that resets on input.
 - Ask the applier for `status` and `connected`; do not parse monitor topology independently.
-- Dim unavailable rows and skip them during navigation.
-- Keys: `Super+O`/`Down`/`j` next, `Up`/`k` previous, `1`–`4` apply that row directly, `Enter` apply, `Esc` cancel. The footer carries these hints and a 3 s auto-close countdown that resets on input.
-- Launch the applier detached; on failure send a `notify-send` notification with the applier's last error line.
+- Launch the applier detached; on failure send a `notify-send` notification titled `<Group> · <mode> failed` with the applier's last error line.
+- Keep `cs2-2k` applier-only, with no row.
 - Retain the existing single-instance/PID behavior.
 
 The adapter-era eight-second cooldown is removed. Concurrency belongs to the applier lock; the overlay only prevents duplicate windows.

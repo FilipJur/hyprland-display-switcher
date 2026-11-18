@@ -88,21 +88,32 @@ exec-once = sh -c 'sleep 3 && hyprctl reload; exec python3 ~/.local/bin/display-
 
 ## Usage
 
-Press `Super+O` to open the terminal-style overlay: a monospace panel with a
-warm dark background and a single cyan accent, a header showing the active
-mode, a `$ display-apply.sh` prompt with a blinking cursor, and one row per
-mode (`monitor`, `cs2`, `tv`, `tv-alt`) with device/spec columns and a
-`● active` or `not connected` tag. Unavailable rows are dimmed and skipped.
+Press `Super+O` to open the terminal-style overlay: IBM Plex Mono (installed
+user-level in `~/.local/share/fonts`; JetBrainsMono Nerd Font, then DejaVu Sans
+Mono as fallbacks) on a warm dark panel with a single cyan accent. The header
+reads `Display switcher` with `active: <Group> · <mode>`, followed by a
+`$ display-apply.sh <selected mode id>` prompt with a blinking cursor.
 
-- `Super+O`, `Down`, or `j` — next row
-- `Up` or `k` — previous row
-- `1`–`4` — apply that row directly
-- `Enter` — apply the selected row
-- `Esc` — cancel
+Modes are grouped by display, each group heading carrying device, connector and
+a `not connected` marker:
 
-The footer shows these key hints plus a 3 s auto-close countdown that resets
-on input. Applying launches the applier detached; a failure raises a
-`notify-send` notification with the applier's last error line.
+```
+MONITOR  PHL 345E2 · DP
+  1  Desktop        monitor      ● active
+  2  CS2            cs2
+TV       Philips UHDTV · HDMI
+  3  HDR · VRR      tv
+  4  HDR, VRR off   tv-alt
+```
+
+Rows are numbered for the digit keys (`cs2-2k` is applier-only and has no
+row); the rows of a disconnected display are dimmed and skipped. Footer:
+`↑↓ move · 1–4 jump · enter apply · esc cancel`, plus a 3 s auto-close
+countdown that resets on input.
+
+Applying launches the applier detached; a failure raises a `notify-send`
+notification titled `<Group> · <mode> failed` with the applier's last error
+line.
 
 The header and the `● active` row follow
 `display_apply.sh status` (`monitor`, `cs2`, `cs2-2k`, `tv`, `tv-alt`, or
@@ -121,7 +132,7 @@ The header and the `● active` row follow
 
 ## Files
 
-- `src/display_switcher.py` — GTK3 terminal-style overlay: active-mode header, `$ display-apply.sh` prompt, one row per mode (`monitor`, `cs2`, `tv`, `tv-alt`), dimmed unavailable rows, detached apply with failure notification
+- `src/display_switcher.py` — GTK3 terminal-style overlay: `Display switcher` header, grouped mode rows (Desktop, CS2 / HDR · VRR, HDR, VRR off), digit keys, dimmed disconnected groups, detached apply with failure notification
 - `src/display_apply.sh` — discovery, preflight, atomic generated config, safe transition, workspace migration, verification, `connected`/`ensure` failover
 - `src/display_watch.py` — hotplug watcher: runs `display_apply.sh ensure` on boot and monitor add/remove
 - `config/display-switcher.css` — GTK styling matching the HyDE "Another World" theme

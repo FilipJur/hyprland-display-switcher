@@ -46,10 +46,10 @@ HDMI 2.1 FRL12 and VRR are proven on this hardware (see Tested Environment and P
 
 | File | Responsibility |
 |---|---|
-| `src/display_switcher.py` | Terminal-style GTK presentation: active-mode header, `$ display-apply.sh` prompt, one row per mode (`monitor`, `cs2`, `tv`, `tv-alt`; `cs2-2k` is applier-only), dimmed and skipped unavailable rows, detached apply, failure notification |
+| `src/display_switcher.py` | Terminal-style GTK presentation in IBM Plex Mono: `Display switcher` header with `active: <Group> · <mode>`, prompt, mode rows grouped by display (Desktop, CS2 / HDR · VRR, HDR, VRR off; `cs2-2k` is applier-only), numbered 1–4, `● active` tag, disconnected displays dimmed and skipped, detached apply, failure notification |
 | `src/display_apply.sh` | Discovery, status/connected/ensure, preflight, safe transition, generated config, workspace migration, verification |
 | `src/display_watch.py` | Hotplug failover: socket2 `monitoradded`/`monitorremoved`, 3 s debounce, runs `ensure` at startup and after events |
-| `config/display-switcher.css` | Terminal-style theme: monospace, warm dark panel, single cyan accent |
+| `config/display-switcher.css` | Terminal-style theme: IBM Plex Mono with JetBrainsMono Nerd Font / DejaVu Sans Mono fallbacks, warm dark panel, single cyan accent |
 | `monitors.conf` | Comments plus `WAYLAND-1/2` disables; no `monitorv2` blocks (cold-boot fallback is HyDE's `monitor = ,preferred,auto,auto` in `base.conf`) |
 | `install.sh` | Symlinks, dependency checks, source-order validation, stale project-link cleanup |
 | `ARCHITECTURE.md` | Design record |
