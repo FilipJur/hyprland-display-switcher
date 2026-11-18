@@ -42,6 +42,13 @@ desc:Philips Consumer Electronics Company Philips UHDTV 0x01010101
 - Fail-closed: if the requested display or the exact target mode is
   unavailable, the applier exits nonzero before changing topology. Reapplying
   the current mode is idempotent.
+- Failover: `display_watch.py` listens to Hyprland's event socket and, 3 s
+  after monitor hotplug events settle (and once at startup), runs
+  `display_apply.sh ensure`. While any known display is enabled it does
+  nothing, so a working display is never switched away from. When none is
+  enabled (TV unplugged or powered off in TV mode, monitor off in monitor
+  mode, or booting into a saved mode whose display is gone), it applies the
+  monitor profile if the monitor is connected, else the TV profile.
 
 ## Installation
 
@@ -49,7 +56,7 @@ desc:Philips Consumer Electronics Company Philips UHDTV 0x01010101
 ./install.sh
 ```
 
-This symlinks `display-switcher.py` and `display-apply.sh` into
+This symlinks `display-switcher.py`, `display-apply.sh`, and `display-watch.py` into
 `~/.local/bin/`, installs the overlay CSS, verifies runtime dependencies,
 validates that your `hyprland.conf` sources `monitors.conf` before
 `display-switcher-generated.conf`, and removes stale repository-owned links.
@@ -61,6 +68,13 @@ Add the keybinding to `~/.config/hypr/keybindings.conf`:
 
 ```
 bindd = $mainMod, O, Toggle display mode, exec, python3 ~/.local/bin/display-switcher.py
+```
+
+Start the failover watcher after the startup reload in
+`~/.config/hypr/userprefs.conf`:
+
+```
+exec-once = sh -c 'sleep 3 && hyprctl reload; exec python3 ~/.local/bin/display-watch.py'
 ```
 
 ## Usage
@@ -76,6 +90,7 @@ The overlay marks the current mode as reported by
 
 ```bash
 ~/.local/bin/display-apply.sh status
+~/.local/bin/display-apply.sh ensure
 ~/.local/bin/display-apply.sh monitor
 ~/.local/bin/display-apply.sh tv
 ```
@@ -83,7 +98,8 @@ The overlay marks the current mode as reported by
 ## Files
 
 - `src/display_switcher.py` — GTK3 overlay: two mode buttons, status display, async invocation
-- `src/display_apply.sh` — discovery, preflight, atomic generated config, safe transition, workspace migration, verification
+- `src/display_apply.sh` — discovery, preflight, atomic generated config, safe transition, workspace migration, verification, `ensure` failover
+- `src/display_watch.py` — hotplug watcher: runs `display_apply.sh ensure` on boot and monitor add/remove
 - `config/display-switcher.css` — GTK styling matching the HyDE "Another World" theme
 - `monitors.conf` — EDID-based cold-start profile (monitor active, TV disabled)
 - `install.sh` — symlinks, dependency checks, source-order validation

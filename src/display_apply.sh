@@ -10,7 +10,10 @@
 # Discovery is identity-based (EDID fields + HDMI connector class); connector
 # names are runtime data only. Every apply verifies effective compositor state.
 #
-# CLI:  display_apply.sh status|monitor|tv
+# CLI:  display_apply.sh status|ensure|monitor|cs2|cs2-2k|tv|tv-alt
+# ensure: no-op while any known display is enabled; otherwise enables a
+# connected one (monitor first, then tv). Used by display_watch.py on boot
+# and hotplug so a vanished output never leaves the session dark.
 # Exit: 0 success · 2 usage · 3 discovery/preflight (no mutation) ·
 #       4 apply/verification failure · 5 lock held by another apply
 # stdout: `status` token, or one success line for apply. Diagnostics: stderr + log.
@@ -59,7 +62,7 @@ POLL_MAX=50         # bounded: 50 checks at 100 ms ≈ five seconds
 MONITORS_JSON=""
 MON_PRESENT=0 MON_ENABLED=0 MON_CONN=""
 TV_PRESENT=0 TV_ENABLED=0 TV_CONN=""
-TARGET_ROLE="" SRC_ACTIVE=0 SRC_CONN="" TGT_CONN=""
+TARGET_ROLE="" SRC_ACTIVE=0 SRC_CONN="" TGT_CONN="" TGT_WAS_ENABLED=0
 VT_WHY="" VT_OBS=""
 PREV_PATH="" LAST_TMP="" SNAP_HDR="" SNAP_VRR=""
 
@@ -80,6 +83,8 @@ usage() {
   cat >&2 <<'EOF'
 usage: display-apply.sh <command>
 commands:
+  ensure    no-op while any known display is enabled; otherwise enable a
+            connected one: monitor first, then tv
   monitor   apply the PHL 345E2 profile: 3440x1440@74.98, 8-bit SDR, VRR
             off, scale 1
   cs2       apply the PHL 345E2 CS2 profile: custom 1920x1080@~75
@@ -485,6 +490,14 @@ snapshot_state() { # previous generated file (byte copy) + live globals (prefer_
 }
 
 restore_on_failure() { # restore persistent file + reload it, then snapshotted globals via IPC
+  if (( ! SRC_ACTIVE && ! TGT_WAS_ENABLED )); then
+    # Nothing was active before this apply, so the previous file is a
+    # zero-display state. Keep the new file: it at least enables the target.
+    log "no display was active before this apply; keeping the new generated config"
+    [[ -n "$PREV_PATH" ]] && rm -f -- "$PREV_PATH"
+    PREV_PATH=""
+    return 0
+  fi
   if [[ -n "$PREV_PATH" && -f "$PREV_PATH" ]]; then
     if mv -f -- "$PREV_PATH" "$GENERATED_CONFIG"; then
       # The restored file enables exactly its previous target, so this reload
@@ -572,6 +585,10 @@ apply_flow() { # apply_flow <role> — caller holds the lock
     SRC_ACTIVE=1
     SRC_CONN=$(role_conn "$other_role")
   fi
+  TGT_WAS_ENABLED=$(role_enabled "$role")
+  # A target waking from a dark session (disabled output, panel asleep) can
+  # report 0x0 for several seconds; allow 15 s instead of 5 s.
+  (( SRC_ACTIVE || TGT_WAS_ENABLED )) || POLL_MAX=150
 
   snapshot_state
   log "applying $role mode (target=$TGT_CONN, source=$( ((SRC_ACTIVE)) && echo "$SRC_CONN" || echo none ))"
@@ -603,6 +620,25 @@ apply_flow() { # apply_flow <role> — caller holds the lock
   echo "$role mode applied"
 }
 
+ensure_flow() { # ensure_flow — caller holds the lock
+  fetch_monitors || die 3 "discovery failed: hyprctl -j monitors all returned no valid JSON"
+  discover
+  if (( (MON_PRESENT && MON_ENABLED) || (TV_PRESENT && TV_ENABLED) )); then
+    echo "display active; nothing to do"
+    return 0
+  fi
+  local role
+  if (( MON_PRESENT )); then
+    role=monitor
+  elif (( TV_PRESENT )); then
+    role=tv
+  else
+    die 3 "no known display connected"
+  fi
+  log "no active display; failing over to $role"
+  apply_flow "$role"
+}
+
 # --------------------------------------------------------------------- main ---
 
 main() {
@@ -623,6 +659,12 @@ main() {
       ensure_ipc_sig
       acquire_lock
       apply_flow "$1"
+      ;;
+    ensure)
+      require_deps
+      ensure_ipc_sig
+      acquire_lock
+      ensure_flow
       ;;
     *)
       usage

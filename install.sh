@@ -101,7 +101,8 @@ remove_repo_owned_link "fix-pcon-audio.py"
 # Executable symlinks for the overlay and the applier
 ln -sfn "$SCRIPT_DIR/src/display_switcher.py" "$BIN_DIR/display-switcher.py"
 ln -sfn "$SCRIPT_DIR/src/display_apply.sh" "$BIN_DIR/display-apply.sh"
-chmod +x "$SCRIPT_DIR/src/display_switcher.py" "$SCRIPT_DIR/src/display_apply.sh"
+ln -sfn "$SCRIPT_DIR/src/display_watch.py" "$BIN_DIR/display-watch.py"
+chmod +x "$SCRIPT_DIR/src/display_switcher.py" "$SCRIPT_DIR/src/display_apply.sh" "$SCRIPT_DIR/src/display_watch.py"
 
 # Install CSS config if not exists
 if [[ ! -f "$CONFIG_DIR/display-switcher.css" ]]; then
@@ -115,6 +116,7 @@ echo ""
 echo "Installed (symlinks):"
 echo "  $BIN_DIR/display-switcher.py -> src/display_switcher.py"
 echo "  $BIN_DIR/display-apply.sh -> src/display_apply.sh"
+echo "  $BIN_DIR/display-watch.py -> src/display_watch.py"
 echo ""
 
 # Runtime dependencies
