@@ -1,11 +1,12 @@
 #!/usr/bin/env python3
 """Hyprland Display Switcher - terminal-style overlay for monitor, CS2 and TV modes.
 
-A CLI-flavoured panel lists one row per mode with aligned id/device/spec columns
-and a status tag. Rows whose display is not connected (per
-`display-apply.sh connected`) are dimmed and skipped when moving. Confirmed
-modes run detached from the overlay; a failed apply raises a desktop
-notification with the applier's error.
+A CLI-flavoured panel groups the modes by display: an uppercase group heading
+with its device, then one row per mode with aligned number/name/spec columns and
+a status tag. Rows whose display is not connected (per
+`display-apply.sh connected`) are dimmed and skipped when moving; the group
+heading carries the reason. Confirmed modes run detached from the overlay; a
+failed apply raises a desktop notification with the applier's error.
 """
 
 import math
@@ -37,18 +38,49 @@ APPLIER_SCRIPT = os.path.expanduser("~/.local/bin/display-apply.sh")
 TIMEOUT_SECONDS = 3
 CURSOR_BLINK_MS = 530
 
-# Display role each mode needs, as reported by `display-apply.sh connected`.
-MODE_ROLES = {
-    "monitor": "monitor",
-    "cs2": "monitor",
-    "cs2-2k": "monitor",
-    "tv": "tv",
-    "tv-alt": "tv",
-}
+# Display role each group needs, as reported by `display-apply.sh connected`.
+GROUPS: List[Dict[str, Any]] = [
+    {
+        "role": "monitor",
+        "label": "MONITOR",
+        "title": "Monitor",
+        "device": "PHL 345E2 · DP",
+        "modes": [
+            {"id": "monitor", "name": "Desktop", "spec": "3440×1440 · 75 Hz · SDR"},
+            {"id": "cs2", "name": "CS2", "spec": "1080p · 75 Hz · 16:9"},
+        ],
+    },
+    {
+        "role": "tv",
+        "label": "TV",
+        "title": "TV",
+        "device": "Philips UHDTV · HDMI",
+        "modes": [
+            {"id": "tv", "name": "HDR · VRR", "spec": "4K · 144 Hz"},
+            {"id": "tv-alt", "name": "HDR", "spec": "4K · 144 Hz · VRR off"},
+        ],
+    },
+]
+
+# Flat row order (digits 1-4); navigation, selection and apply are row-based.
+ROWS: List[Dict[str, Any]] = [
+    {
+        "id": mode["id"],
+        "name": mode["name"],
+        "spec": mode["spec"],
+        "role": group["role"],
+        "group_title": group["title"],
+    }
+    for group in GROUPS
+    for mode in group["modes"]
+]
+
+# Status tokens the applier may report that have no row of their own.
+STATUS_MODES = {row["id"] for row in ROWS} | {"cs2-2k"}
 
 # Runs the applier detached from the overlay; on failure notifies with its last
 # stderr line (log prefix stripped) and keeps the applier's exit code.
-# $0 = applier script, $1 = mode id, $2 = mode name.
+# $0 = applier script, $1 = mode id, $2 = notification name.
 APPLY_WRAPPER = r"""
 err=$("$0" "$1" 2>&1 >/dev/null)
 rc=$?
@@ -60,52 +92,57 @@ fi
 exit "$rc"
 """
 
-MODES: List[Dict[str, Any]] = [
-    {
-        "id": "monitor",
-        "name": "Monitor",
-        "device": "PHL 345E2",
-        "desc": "3440×1440 · SDR",
-    },
-    {
-        "id": "cs2",
-        "name": "CS2",
-        "device": "PHL 345E2",
-        "desc": "1080p · 75 Hz · 16:9",
-    },
-    {
-        "id": "tv",
-        "name": "TV",
-        "device": "UHDTV",
-        "desc": "4K · 144 Hz · HDR · VRR",
-    },
-    {
-        "id": "tv-alt",
-        "name": "TV Alt",
-        "device": "UHDTV",
-        "desc": "4K · 144 Hz · HDR · no VRR",
-    },
-]
+
+class GroupHeader(Gtk.Box):
+    """Uppercase display heading: label, device and the reason it is unavailable."""
+
+    def __init__(self, group: Dict[str, Any]):
+        super().__init__(orientation=Gtk.Orientation.HORIZONTAL, spacing=10)
+        self.role = group["role"]
+        self.set_name("group-header")
+
+        label = Gtk.Label(label=group["label"])
+        label.set_name("group-label")
+        label.set_xalign(0.0)
+
+        device = Gtk.Label(label=group["device"])
+        device.set_name("group-device")
+        device.set_xalign(0.0)
+
+        self.status = Gtk.Label(label="")
+        self.status.set_name("group-status")
+        self.status.set_xalign(1.0)
+        self.status.set_hexpand(True)
+
+        self.pack_start(label, False, False, 0)
+        self.pack_start(device, False, False, 0)
+        self.pack_end(self.status, True, True, 0)
+
+    def set_available(self, available: bool):
+        self.status.set_text("" if available else "not connected")
 
 
 class ModeRow(Gtk.Box):
-    """One menu row: marker, mode id, device, spec and status tag."""
+    """One menu row: number, marker, mode name, spec and status tag."""
 
-    def __init__(self, mode_data: Dict[str, Any], size_groups: List[Gtk.SizeGroup]):
+    def __init__(
+        self, row_data: Dict[str, Any], number: int, size_groups: List[Gtk.SizeGroup]
+    ):
         super().__init__(orientation=Gtk.Orientation.HORIZONTAL, spacing=12)
-        self.mode_id = mode_data["id"]
+        self.mode_id = row_data["id"]
         self._current = False
         self._available = True
 
         self.set_name("mode-row")
 
+        self.number = self._make_label(str(number), "row-number")
+        self.number.set_width_chars(1)
         self.marker = self._make_label(" ", "row-marker")
         self.marker.set_width_chars(1)
-        self.id_label = self._make_label(mode_data["id"], "row-id")
-        self.id_label.set_width_chars(9)
-        self.device = self._make_label(mode_data["device"], "row-device")
-        self.device.set_width_chars(9)
-        self.spec = self._make_label(mode_data["desc"], "row-spec")
+        self.name = self._make_label(row_data["name"], "row-name")
+        # Reserve a ~12-char name column so specs never read as part of the name.
+        self.name.set_width_chars(12)
+        self.spec = self._make_label(row_data["spec"], "row-spec")
         self.status = self._make_label("", "row-status")
         self.status.set_xalign(1.0)
         self.status.set_hexpand(True)
@@ -113,7 +150,7 @@ class ModeRow(Gtk.Box):
         # Status is not size-grouped: it takes the rest of the row and right-aligns
         # against the row padding, so every tag ends on the same edge.
         for column, label in enumerate(
-            (self.marker, self.id_label, self.device, self.spec)
+            (self.number, self.marker, self.name, self.spec)
         ):
             size_groups[column].add_widget(label)
             self.pack_start(label, False, False, 0)
@@ -143,23 +180,15 @@ class ModeRow(Gtk.Box):
             self.get_style_context().remove_class("unavailable")
         else:
             self.get_style_context().add_class("unavailable")
-        self._sync_status()
 
     def _sync_status(self):
-        """Unavailable wins over active: a row that is gone must say so."""
         context = self.status.get_style_context()
-        if not self._available:
-            self.status.set_text("not connected")
-            context.add_class("tag-error")
-            context.remove_class("tag-active")
-        elif self._current:
+        if self._current:
             self.status.set_text("● active")
             context.add_class("tag-active")
-            context.remove_class("tag-error")
         else:
             self.status.set_text("")
             context.remove_class("tag-active")
-            context.remove_class("tag-error")
 
 
 class DisplaySwitcher(Gtk.Window):
@@ -200,6 +229,7 @@ class DisplaySwitcher(Gtk.Window):
         self.cursor_dimmed = False
         self.deadline = 0.0
         self.rows: List[ModeRow] = []
+        self.group_headers: List[GroupHeader] = []
         self.selected_index = self.get_next_index()
 
         self.build_ui()
@@ -214,11 +244,14 @@ class DisplaySwitcher(Gtk.Window):
         self.reset_timer()
         self.cursor_timer_id = GLib.timeout_add(CURSOR_BLINK_MS, self.on_cursor_blink)
 
-    def is_available(self, index: int) -> bool:
+    def is_available_role(self, role: str) -> bool:
         """Unknown availability (not queried yet, or discovery failed) counts as available."""
         if self.connected_roles is None:
             return True
-        return MODE_ROLES.get(MODES[index]["id"]) in self.connected_roles
+        return role in self.connected_roles
+
+    def is_available(self, index: int) -> bool:
+        return self.is_available_role(ROWS[index]["role"])
 
     def request_connected(self):
         """Read the connected displays without blocking the GTK main loop."""
@@ -267,6 +300,8 @@ class DisplaySwitcher(Gtk.Window):
             return
         for i, row in enumerate(self.rows):
             row.set_available(self.is_available(i))
+        for header in self.group_headers:
+            header.set_available(self.is_available_role(header.role))
         self.refresh_selection()
 
     def request_status(self):
@@ -308,11 +343,18 @@ class DisplaySwitcher(Gtk.Window):
         self.set_current_mode(status)
         return False
 
+    def describe_mode(self, mode: str) -> str:
+        """Return "Monitor · Desktop" for a row, the bare token otherwise (cs2-2k)."""
+        for row in ROWS:
+            if row["id"] == mode:
+                return f"{row['group_title']} · {row['name']}"
+        return mode
+
     def set_current_mode(self, mode: str):
-        if mode not in {"monitor", "cs2", "cs2-2k", "tv", "tv-alt"}:
+        if mode not in STATUS_MODES:
             mode = "unknown"
         self.current_mode = mode
-        self.active_label.set_text(f"active: {mode}")
+        self.active_label.set_text(f"active: {self.describe_mode(mode)}")
 
         for row in self.rows:
             row.set_current(row.mode_id == mode)
@@ -321,9 +363,7 @@ class DisplaySwitcher(Gtk.Window):
 
     def refresh_selection(self):
         if not self.selection_interacted and self.rows:
-            self.rows[self.selected_index].set_selected(False)
-            self.selected_index = self.get_next_index()
-            self.rows[self.selected_index].set_selected(True)
+            self.set_selected_index(self.get_next_index())
 
     def load_css(self):
         css_provider = Gtk.CssProvider()
@@ -360,7 +400,7 @@ class DisplaySwitcher(Gtk.Window):
 }
 
 #display-switcher label {
-    font-family: "CaskaydiaCove Nerd Font Mono", "JetBrains Mono", "DejaVu Sans Mono", monospace;
+    font-family: "IBM Plex Mono", "JetBrainsMono Nerd Font", "DejaVu Sans Mono", monospace;
 }
 
 /* ── Panel ── */
@@ -382,7 +422,7 @@ class DisplaySwitcher(Gtk.Window):
 #term-title {
     color: @term_text;
     font-size: 16px;
-    font-weight: 700;
+    font-weight: 600;
 }
 
 #term-active {
@@ -401,6 +441,12 @@ class DisplaySwitcher(Gtk.Window):
     font-weight: 600;
 }
 
+#prompt-mode {
+    color: @term_accent;
+    font-size: 16px;
+    font-weight: 600;
+}
+
 #prompt-cursor {
     color: @term_accent;
     font-size: 16px;
@@ -411,13 +457,36 @@ class DisplaySwitcher(Gtk.Window):
     opacity: 0;
 }
 
+/* ── Group heading: uppercase label · device · not connected ── */
+#group-header {
+    margin: 12px 0 4px 0;
+}
+
+#group-label {
+    color: @term_muted;
+    font-size: 11px;
+    font-weight: 700;
+    letter-spacing: 2px;
+}
+
+#group-device {
+    color: @term_muted;
+    font-size: 11px;
+}
+
+#group-status {
+    color: @term_error;
+    font-size: 11px;
+}
+
 /* ── Mode rows ── */
 #mode-row {
     background: @term_row;
     border: 1px solid @term_border;
     border-left: 3px solid transparent;
     border-radius: 0;
-    padding: 7px 10px;
+    padding: 6px 10px;
+    margin: 2px 0 2px 16px;
 }
 
 #mode-row:hover {
@@ -430,25 +499,29 @@ class DisplaySwitcher(Gtk.Window):
     border-left: 3px solid @term_accent;
 }
 
+#row-number {
+    color: @term_muted;
+    font-size: 11px;
+}
+
 #row-marker {
     color: @term_accent;
     font-size: 13px;
     font-weight: 700;
 }
 
-#row-id {
+#row-name {
     color: @term_text;
     font-size: 13px;
     font-weight: 600;
 }
 
-#row-device,
 #row-spec {
     color: @term_muted;
     font-size: 13px;
 }
 
-#mode-row.selected #row-id {
+#mode-row.selected #row-name {
     color: @term_accent;
 }
 
@@ -465,10 +538,6 @@ class DisplaySwitcher(Gtk.Window):
     color: @term_accent;
 }
 
-#row-status.tag-error {
-    color: @term_error;
-}
-
 /* ── Unavailable rows: dimmed, never look selectable ── */
 #mode-row.unavailable,
 #mode-row.unavailable:hover,
@@ -478,11 +547,11 @@ class DisplaySwitcher(Gtk.Window):
     border-left: 3px solid transparent;
 }
 
+#mode-row.unavailable #row-number,
 #mode-row.unavailable #row-marker,
-#mode-row.unavailable #row-id,
-#mode-row.unavailable #row-device,
+#mode-row.unavailable #row-name,
 #mode-row.unavailable #row-spec,
-#mode-row.unavailable.selected #row-id {
+#mode-row.unavailable.selected #row-name {
     color: @term_dim;
 }
 
@@ -504,13 +573,13 @@ class DisplaySwitcher(Gtk.Window):
 """
 
     def get_next_index(self) -> int:
-        mode_ids = [m["id"] for m in MODES]
+        mode_ids = [row["id"] for row in ROWS]
         if self.current_mode in mode_ids:
-            base = (mode_ids.index(self.current_mode) + 1) % len(MODES)
+            base = (mode_ids.index(self.current_mode) + 1) % len(ROWS)
         else:
             base = 0
-        for step in range(len(MODES)):
-            candidate = (base + step) % len(MODES)
+        for step in range(len(ROWS)):
+            candidate = (base + step) % len(ROWS)
             if self.is_available(candidate):
                 return candidate
         return base
@@ -533,10 +602,12 @@ class DisplaySwitcher(Gtk.Window):
 
         header = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=12)
         header.set_name("terminal-header")
-        title = Gtk.Label(label="display-switcher")
+        title = Gtk.Label(label="Display switcher")
         title.set_name("term-title")
         title.set_xalign(0.0)
-        self.active_label = Gtk.Label(label=f"active: {self.current_mode}")
+        self.active_label = Gtk.Label(
+            label=f"active: {self.describe_mode(self.current_mode)}"
+        )
         self.active_label.set_name("term-active")
         self.active_label.set_xalign(1.0)
         self.active_label.set_hexpand(True)
@@ -548,25 +619,33 @@ class DisplaySwitcher(Gtk.Window):
         prompt = Gtk.Label(label="$ display-apply.sh")
         prompt.set_name("prompt-text")
         prompt.set_xalign(0.0)
+        self.prompt_mode = Gtk.Label(label="")
+        self.prompt_mode.set_name("prompt-mode")
+        self.prompt_mode.set_xalign(0.0)
         self.cursor = Gtk.Label(label="▌")
         self.cursor.set_name("prompt-cursor")
         self.cursor.set_xalign(0.0)
         prompt_row.pack_start(prompt, False, False, 0)
+        prompt_row.pack_start(self.prompt_mode, False, False, 0)
         prompt_row.pack_start(self.cursor, False, False, 0)
 
         size_groups = [
             Gtk.SizeGroup(mode=Gtk.SizeGroupMode.HORIZONTAL) for _ in range(4)
         ]
-        rows_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4)
+        rows_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=0)
         rows_box.set_name("mode-list")
-        for mode in MODES:
-            row = ModeRow(mode, size_groups)
-            self.rows.append(row)
-            rows_box.pack_start(row, False, False, 0)
+        for group in GROUPS:
+            header_row = GroupHeader(group)
+            self.group_headers.append(header_row)
+            rows_box.pack_start(header_row, False, False, 0)
+            for mode in group["modes"]:
+                row = ModeRow(mode, len(self.rows) + 1, size_groups)
+                self.rows.append(row)
+                rows_box.pack_start(row, False, False, 0)
 
         footer = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=12)
         footer.set_name("footer")
-        hints = Gtk.Label(label="↑↓/super+o move · enter apply · esc cancel")
+        hints = Gtk.Label(label="↑↓ move · 1–4 jump · enter apply · esc cancel")
         hints.set_name("footer-hints")
         hints.set_xalign(0.0)
         self.countdown = Gtk.Label(label="")
@@ -574,7 +653,7 @@ class DisplaySwitcher(Gtk.Window):
         self.countdown.set_xalign(1.0)
         self.countdown.set_hexpand(True)
         footer.pack_start(hints, False, False, 0)
-        footer.pack_start(self.countdown, True, True, 0)
+        footer.pack_end(self.countdown, True, True, 0)
 
         panel.pack_start(header, False, False, 0)
         panel.pack_start(prompt_row, False, False, 0)
@@ -585,9 +664,9 @@ class DisplaySwitcher(Gtk.Window):
         overlay.pack_start(center, True, True, 0)
         self.add(overlay)
 
-        self.refresh_availability()
         for row in self.rows:
             row.set_current(row.mode_id == self.current_mode)
+        self.refresh_availability()
 
     def on_key_press(self, widget, event):
         keyval = event.keyval
@@ -649,6 +728,10 @@ class DisplaySwitcher(Gtk.Window):
         self.rows[self.selected_index].set_selected(False)
         self.selected_index = index
         self.rows[self.selected_index].set_selected(True)
+        self.update_prompt()
+
+    def update_prompt(self):
+        self.prompt_mode.set_text(f" {ROWS[self.selected_index]['id']}")
 
     def apply_row(self, index: int):
         """Number-key shortcut: select and apply a row; unavailable rows do nothing."""
@@ -665,11 +748,12 @@ class DisplaySwitcher(Gtk.Window):
         if not self.is_available(self.selected_index):
             self.reset_timer()
             return
-        mode = MODES[self.selected_index]
+        mode = ROWS[self.selected_index]
+        name = f"{mode['group_title']} · {mode['name']}"
         self.close()
         try:
             subprocess.Popen(
-                ["sh", "-c", APPLY_WRAPPER, APPLIER_SCRIPT, mode["id"], mode["name"]],
+                ["sh", "-c", APPLY_WRAPPER, APPLIER_SCRIPT, mode["id"], name],
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL,
                 start_new_session=True,

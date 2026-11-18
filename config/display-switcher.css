@@ -16,7 +16,7 @@
 }
 
 #display-switcher label {
-    font-family: "CaskaydiaCove Nerd Font Mono", "JetBrains Mono", "DejaVu Sans Mono", monospace;
+    font-family: "IBM Plex Mono", "JetBrainsMono Nerd Font", "DejaVu Sans Mono", monospace;
 }
 
 /* ── Panel ── */
@@ -38,7 +38,7 @@
 #term-title {
     color: @term_text;
     font-size: 16px;
-    font-weight: 700;
+    font-weight: 600;
 }
 
 #term-active {
@@ -57,6 +57,12 @@
     font-weight: 600;
 }
 
+#prompt-mode {
+    color: @term_accent;
+    font-size: 16px;
+    font-weight: 600;
+}
+
 #prompt-cursor {
     color: @term_accent;
     font-size: 16px;
@@ -67,13 +73,36 @@
     opacity: 0;
 }
 
+/* ── Group heading: uppercase label · device · not connected ── */
+#group-header {
+    margin: 12px 0 4px 0;
+}
+
+#group-label {
+    color: @term_muted;
+    font-size: 11px;
+    font-weight: 700;
+    letter-spacing: 2px;
+}
+
+#group-device {
+    color: @term_muted;
+    font-size: 11px;
+}
+
+#group-status {
+    color: @term_error;
+    font-size: 11px;
+}
+
 /* ── Mode rows ── */
 #mode-row {
     background: @term_row;
     border: 1px solid @term_border;
     border-left: 3px solid transparent;
     border-radius: 0;
-    padding: 7px 10px;
+    padding: 6px 10px;
+    margin: 2px 0 2px 16px;
 }
 
 #mode-row:hover {
@@ -86,25 +115,29 @@
     border-left: 3px solid @term_accent;
 }
 
+#row-number {
+    color: @term_muted;
+    font-size: 11px;
+}
+
 #row-marker {
     color: @term_accent;
     font-size: 13px;
     font-weight: 700;
 }
 
-#row-id {
+#row-name {
     color: @term_text;
     font-size: 13px;
     font-weight: 600;
 }
 
-#row-device,
 #row-spec {
     color: @term_muted;
     font-size: 13px;
 }
 
-#mode-row.selected #row-id {
+#mode-row.selected #row-name {
     color: @term_accent;
 }
 
@@ -121,10 +154,6 @@
     color: @term_accent;
 }
 
-#row-status.tag-error {
-    color: @term_error;
-}
-
 /* ── Unavailable rows: dimmed, never look selectable ── */
 #mode-row.unavailable,
 #mode-row.unavailable:hover,
@@ -134,11 +163,11 @@
     border-left: 3px solid transparent;
 }
 
+#mode-row.unavailable #row-number,
 #mode-row.unavailable #row-marker,
-#mode-row.unavailable #row-id,
-#mode-row.unavailable #row-device,
+#mode-row.unavailable #row-name,
 #mode-row.unavailable #row-spec,
-#mode-row.unavailable.selected #row-id {
+#mode-row.unavailable.selected #row-name {
     color: @term_dim;
 }
 
