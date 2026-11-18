@@ -37,10 +37,10 @@ HDMI 2.1 FRL12 and VRR are proven on this hardware (see Tested Environment and P
 4. Verify effective JSON state after every mutation, and the DRM state via read-only `modetest` where available. A successful command exit is not proof.
 5. No automatic downgrade from 4K144, 10-bit, HDR, or VRR: explicit user settings are not automatic, and `ensure` applies defaults only when no known display is enabled.
 6. No sudo or privileged operations in project code.
-7. No audio routing, Extend, Mirror, PCON/DPCD, DPM, adapter reset, daemon-kill, or Lua-generation compatibility path.
+7. No audio routing, Extend, Mirror, PCON/DPCD, DPM, adapter reset, or daemon-kill. Dual generation of `display-switcher-generated.conf` and `display-switcher-generated.lua` from one resolved request is required while the hyprlang config exists; remove the hyprlang generation path once `hyprland.conf` is deleted.
 8. Keep `research/` unchanged as adapter-era history.
 9. Touch only files assigned by the current task; `plan.md` gates are passed history.
-10. The clean cutover is complete: do not reintroduce deleted helpers, aliases, adapter-era kernel parameters, or compatibility paths.
+10. The clean cutover is complete: do not reintroduce deleted helpers, aliases, adapter-era kernel parameters, or compatibility paths (the dual-format generated files in invariant 7 are the sole exception).
 
 ## Runtime Boundaries
 
@@ -56,7 +56,7 @@ HDMI 2.1 FRL12 and VRR are proven on this hardware (see Tested Environment and P
 | `plan.md` | Passed implementation and acceptance gates |
 | `research/` | Historical evidence only; not runtime guidance |
 
-The deployed HyDE config sources `monitors.conf` and then `display-switcher-generated.conf`. The single hyprlang `monitorv2` generator is implemented; the abandoned dual hyprlang/Lua branch was deleted in the cutover. The overlay builds its controls from `caps` and remembers settings per display in `~/.local/state/display-switcher-settings.json`; only non-default keys reach the command line.
+The deployed HyDE config sources `monitors.conf` and then `display-switcher-generated.conf`; a Lua session loads `display-switcher-generated.lua` (`require("display-switcher-generated")` from the staged or live `hyprland.lua`). While the hyprlang config exists, every apply writes both files from the same resolved request and detects the running manager once per apply (`hyprctl eval`: reply `ok` = Lua, the "only supported with the lua config manager" reply = hyprlang, anything else = exit 3). The overlay builds its controls from `caps` and remembers settings per display in `~/.local/state/display-switcher-settings.json`; only non-default keys reach the command line.
 
 ## Hardware Identity
 

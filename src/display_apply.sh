@@ -1,6 +1,9 @@
 #!/usr/bin/env bash
 # display_apply.sh — sole display control plane for the native-HDMI switcher.
 # Authoritative behavior: ARCHITECTURE.md ("src/display_apply.sh: sole control plane").
+# Config managers: hyprlang and Lua are both supported until the hyprlang
+# config is deleted. The running manager is detected once per apply
+# (`hyprctl eval`); every apply writes BOTH generated files.
 #
 # Per-display settings: `monitor` and `tv` take optional res=WxH, hz=N,
 # vrr=0|1, hdr=0|1 and scale=S keys; omitted keys fall back to that role's
@@ -17,7 +20,8 @@
 # connected one (monitor first, then tv) with that role's defaults. Used by
 # display_watch.py on boot and hotplug so a vanished output never leaves the
 # session dark.
-# Exit: 0 success · 2 usage · 3 discovery/preflight (no mutation) ·
+# Exit: 0 success · 2 usage · 3 discovery/preflight (no mutation; includes an
+#       undetectable config manager) ·
 #       4 apply/verification failure · 5 lock held by another apply
 # stdout: `status` role token, one `caps` JSON object, or one success line for
 # apply. Diagnostics: stderr + log.
@@ -33,6 +37,7 @@ LOG_FILE="$STATE_DIR/display-switcher.log"
 LOCK_FILE="$STATE_DIR/display-apply.lock"
 CONFIG_DIR="$HOME/.config/hypr"
 GENERATED_CONFIG="$CONFIG_DIR/display-switcher-generated.conf"
+GENERATED_LUA="$CONFIG_DIR/display-switcher-generated.lua"
 
 # Role identity. Monitor: exact make/model/serial. TV: HDMI connector class
 # plus exact make/model; the dummy serial 0x01010101 is not identity.
@@ -79,6 +84,9 @@ TV_PRESENT=0 TV_ENABLED=0 TV_CONN=""
 TARGET_ROLE="" SRC_ACTIVE=0 SRC_CONN="" TGT_CONN="" TGT_WAS_ENABLED=0
 VT_WHY="" VT_OBS=""
 PREV_PATH="" LAST_TMP="" SNAP_HDR="" SNAP_VRR=""
+PREV_LUA="" LAST_LUA_TMP=""
+# Running config manager for this apply: hyprlang | lua (see detect_manager).
+CFG_MGR=""
 # Resolved request for the current apply (see parse_request/preflight_request).
 REQ_ROLE="" REQ_RES="" REQ_W="" REQ_H="" REQ_HZ="" REQ_VRR="" REQ_HDR="" REQ_SCALE=""
 REQ_BITDEPTH="" REQ_CM=""
@@ -122,15 +130,17 @@ commands:
 custom monitor modes (select with res= + hz=, no extra key):
   1920x1080@74.65  modeline, GPU Full aspect pillarbox
   2560x1440@74.89  modeline, GPU Full aspect pillarbox
-exit codes: 0 success · 2 usage · 3 discovery/preflight (no mutation) ·
-4 apply/verify · 5 lock
+exit codes: 0 success · 2 usage · 3 discovery/preflight or unknown config
+manager (no mutation) · 4 apply/verify · 5 lock
 EOF
   exit 2
 }
 
 cleanup() {
   [[ -n "${LAST_TMP:-}" ]] && rm -f -- "$LAST_TMP"
+  [[ -n "${LAST_LUA_TMP:-}" ]] && rm -f -- "$LAST_LUA_TMP"
   [[ -n "${PREV_PATH:-}" ]] && rm -f -- "$PREV_PATH"
+  [[ -n "${PREV_LUA:-}" ]] && rm -f -- "$PREV_LUA"
 }
 
 # ------------------------------------------------------------ environment -----
@@ -149,6 +159,21 @@ ensure_ipc_sig() {
     sig=$(ls -t /run/user/"$(id -u)"/hypr 2>/dev/null | head -1)
     [[ -n "$sig" ]] && export HYPRLAND_INSTANCE_SIGNATURE="$sig"
   fi
+}
+
+# Detect the running config manager once per apply. `hyprctl keyword` is
+# refused under Lua (exit 0, no effect) and `hyprctl eval` is refused under
+# hyprlang, so the two are told apart by the reply text of a side-effect-free
+# eval. Anything else (no reply, other error) is unknown → exit 3, no mutation.
+detect_manager() {
+  local out
+  out=$(hyprctl eval 'return 1' 2>&1) || true
+  case "$out" in
+    *"only supported with the lua config manager"*) CFG_MGR=hyprlang ;;
+    ok) CFG_MGR=lua ;;
+    *) die 3 "cannot determine the Hyprland config manager (hyprctl eval replied: ${out:-<nothing>})" ;;
+  esac
+  log "config manager: $CFG_MGR"
 }
 
 acquire_lock() {
@@ -458,38 +483,82 @@ emit_block() { # emit_block <role> <selector> <position-override> <disabled 0|1>
   printf '}\n'
 }
 
-# Generated file: role-dependent globals first (misc:vrr, quirks:prefer_hdr)
+# Lua twin of emit_block: same fields and values, hl.monitor() form. Types per
+# MONITOR_FIELDS in LuaBindingsConfigRules.cpp: mode/position/scale/cm/sdr_eotf
+# are strings, the rest numbers; no per-monitor vrr (see emit_block).
+emit_block_lua() { # emit_block_lua <role> <selector> <position-override> <disabled 0|1>
+  local role="$1" sel="$2" pos="$3" dis="$4" kv k v
+  printf 'hl.monitor({\n'
+  printf '    output = "%s",\n' "$sel"
+  printf '    position = "%s",\n' "${pos:-0x0}"
+  printf '    mode = "%s",\n' "$(mode_for "$role" "$(setting "$role" res)" "$(setting "$role" hz)")"
+  printf '    scale = "%s",\n' "$(setting "$role" scale)"
+  for kv in $(color_base "$role" "$(setting "$role" hdr)"); do
+    k="${kv%%=*}"
+    v="${kv#*=}"
+    case "$k" in
+      cm|sdr_eotf)
+        printf '    %s = "%s",\n' "$k" "$v" ;;
+      bitdepth|sdrbrightness|sdrsaturation|sdr_min_luminance|sdr_max_luminance|min_luminance|max_luminance|max_avg_luminance|supports_hdr|supports_wide_color)
+        printf '    %s = %s,\n' "$k" "$v" ;;
+      *) die 4 "internal error: unknown color key '$k'" ;;
+    esac
+  done
+  (( dis )) && printf '    disabled = true,\n'
+  printf '})\n'
+}
+
+# Generated files: role-dependent globals first (misc:vrr, quirks:prefer_hdr)
 # so reload-time rule creation sees them despite later-sourced base defaults,
-# then exactly two monitorv2 rules (target first). Written to a sibling temp
-# file, validated, then atomically renamed.
+# then exactly two monitor rules (target first). Both the hyprlang file and its
+# Lua module carry the same state. Each is written to a sibling temp file,
+# validated, then atomically renamed (hyprlang first, Lua last: in Lua mode the
+# rename of the required module is what the config watcher reacts to).
 write_generated() { # write_generated <target-role> <staging|final>
-  local role="$1" kind="$2" tmp blocks outs
-  local other_role pref vrr
+  local role="$1" kind="$2" tmp ltmp blocks outs lblocks louts
+  local other_role pref vrr opos="" odis=1
   other_role=$(other "$role")
   pref=$(setting "$role" hdr)
   vrr=$(setting "$role" vrr)
+  if [[ "$kind" == staging && "$SRC_ACTIVE" == 1 ]]; then
+    # Keep the connected, active source at a non-overlapping position.
+    opos="auto-right"; odis=0
+  fi
+  # Final state (or inactive/absent source): non-target disabled by description.
   tmp="${GENERATED_CONFIG}.tmp.$$"
+  ltmp="${GENERATED_LUA}.tmp.$$"
   LAST_TMP="$tmp"
+  LAST_LUA_TMP="$ltmp"
   {
     printf 'misc {\n    vrr = %s\n}\n' "$vrr"
     printf 'quirks {\n    prefer_hdr = %s\n}\n' "$pref"
     emit_block "$role" "$(selector "$role")" "" 0
-    if [[ "$kind" == staging && "$SRC_ACTIVE" == 1 ]]; then
-      # Keep the connected, active source at a non-overlapping position.
-      emit_block "$other_role" "$(selector "$other_role")" "auto-right" 0
-    else
-      # Final state (or inactive/absent source): non-target disabled by description.
-      emit_block "$other_role" "$(selector "$other_role")" "" 1
-    fi
-  } >"$tmp" || { rm -f -- "$tmp"; die 4 "failed to write generated config temp file"; }
-  [[ -s "$tmp" ]] || { rm -f -- "$tmp"; die 4 "generated config is empty"; }
+    emit_block "$other_role" "$(selector "$other_role")" "$opos" "$odis"
+  } >"$tmp" || die 4 "failed to write generated config temp file"
+  {
+    printf -- '-- Generated by display_apply.sh; rewritten on every apply. Do not edit.\n'
+    printf 'hl.config({ misc = { vrr = %s }, quirks = { prefer_hdr = %s } })\n' "$vrr" "$pref"
+    emit_block_lua "$role" "$(selector "$role")" "" 0
+    emit_block_lua "$other_role" "$(selector "$other_role")" "$opos" "$odis"
+    printf 'return {}\n'
+  } >"$ltmp" || die 4 "failed to write generated Lua temp file"
+  [[ -s "$tmp" ]] || die 4 "generated config is empty"
+  [[ -s "$ltmp" ]] || die 4 "generated Lua module is empty"
   blocks=$(grep -c '^monitorv2 {' "$tmp")
   outs=$(grep -c '^    output = ' "$tmp")
-  [[ "$blocks" == 2 && "$outs" == 2 ]] || {
-    rm -f -- "$tmp"; die 4 "generated config invalid (blocks=$blocks outputs=$outs)"
-  }
-  mv -f -- "$tmp" "$GENERATED_CONFIG" || { rm -f -- "$tmp"; die 4 "atomic rename of generated config failed"; }
+  [[ "$blocks" == 2 && "$outs" == 2 ]] ||
+    die 4 "generated config invalid (blocks=$blocks outputs=$outs)"
+  lblocks=$(grep -c '^hl\.monitor({' "$ltmp")
+  louts=$(grep -c '^    output = "desc:' "$ltmp")
+  [[ "$lblocks" == 2 && "$louts" == 2 ]] ||
+    die 4 "generated Lua module invalid (blocks=$lblocks outputs=$louts)"
+  if command -v luac5.5 >/dev/null 2>&1; then
+    luac5.5 -p -- "$ltmp" || die 4 "generated Lua module failed luac5.5 -p"
+  fi
+  mv -f -- "$tmp" "$GENERATED_CONFIG" || die 4 "atomic rename of generated config failed"
   LAST_TMP=""
+  mv -f -- "$ltmp" "$GENERATED_LUA" || die 4 "atomic rename of generated Lua module failed"
+  LAST_LUA_TMP=""
 }
 
 # ------------------------------------------------------------ verification ----
@@ -701,24 +770,72 @@ poll_verify() { # poll_verify <predicate-fn>: check every 100 ms, at most 5 s
   return 1
 }
 
+# Set the two globals live. Lua: one `hyprctl eval` (hl.config); `keyword` is
+# refused there with exit 0, so the reply text is checked too. hyprlang: keyword.
+set_globals() { # set_globals <vrr> <prefer_hdr>
+  local out
+  if [[ "$CFG_MGR" == lua ]]; then
+    out=$(hyprctl eval "hl.config({ misc = { vrr = $1 }, quirks = { prefer_hdr = $2 } })" 2>&1) || {
+      log "eval of hl.config failed: $out"; return 1; }
+    [[ "$out" != error* ]] || { log "eval of hl.config failed: $out"; return 1; }
+  else
+    hyprctl keyword misc:vrr "$1" >/dev/null 2>&1 || return 1
+    hyprctl keyword quirks:prefer_hdr "$2" >/dev/null 2>&1 || return 1
+  fi
+}
+
 apply_role_globals() { # reassert the requested globals through IPC after each reload
-  local role="$1" want_vrr want_pref
-  want_vrr=$(setting "$role" vrr)
-  want_pref=$(setting "$role" hdr)
-  hyprctl keyword misc:vrr "$want_vrr" >/dev/null 2>&1 || return 1
-  hyprctl keyword quirks:prefer_hdr "$want_pref" >/dev/null 2>&1 || return 1
+  local role="$1"
+  set_globals "$(setting "$role" vrr)" "$(setting "$role" hdr)"
+}
+
+# Reload, then (Lua) check that the generated module loaded cleanly: `reload`
+# replies ok even when the Lua file raised errors, so read `configerrors`.
+# Only errors that mention the generated module fail the apply. The reload is
+# synchronous in both managers; in Lua mode the config watcher may add one
+# more async reload after the module rename, which re-reads the same file and
+# is harmless (the verification polls state, never timing).
+reload_config() {
+  hyprctl reload >/dev/null 2>&1 || return 1
+  [[ "$CFG_MGR" == lua ]] || return 0
+  local errs
+  errs=$(hyprctl configerrors 2>&1) || true
+  if grep -qi 'display-switcher-generated' <<<"$errs"; then
+    log "ERROR: config errors in the generated module after reload: $(tr '\n' ' ' <<<"$errs" | cut -c1-400)"
+    return 1
+  fi
+  return 0
 }
 
 wake_target_if_needed() { # DPMS wake of the target, only when it is off
   fetch_monitors || return 1
-  local on
+  local on out
   on=$(jq -r --arg c "$TGT_CONN" '[.[] | select(.name == $c) | .dpmsStatus][0]' <<<"$MONITORS_JSON" 2>/dev/null)
   [[ "$on" == "false" ]] || return 0
   log "target $TGT_CONN dpms is off; waking"
-  hyprctl dispatch dpms on "$TGT_CONN" >/dev/null 2>&1
+  if [[ "$CFG_MGR" == lua ]]; then
+    # Hyprland #16471: a selector matching no monitor hits ALL of them, so only
+    # a connector name taken from this run's snapshot is ever passed. Unknown
+    # action strings silently mean "toggle": "enable" is exact.
+    [[ "$TGT_CONN" =~ ^[A-Za-z0-9._-]+$ ]] || return 1
+    out=$(hyprctl dispatch "hl.dsp.dpms({ action = \"enable\", monitor = \"$TGT_CONN\" })" 2>&1) || return 1
+    [[ "$out" != error* ]]
+  else
+    hyprctl dispatch dpms on "$TGT_CONN" >/dev/null 2>&1
+  fi
 }
 
 # ------------------------------------------------------------ workspaces ------
+
+move_workspace() { # move_workspace <id> <connector>
+  local out
+  if [[ "$CFG_MGR" == lua ]]; then
+    out=$(hyprctl dispatch "hl.dsp.workspace.move({ workspace = \"$1\", monitor = \"$2\" })" 2>&1) || return 1
+    [[ "$out" != error* ]]
+  else
+    hyprctl dispatch moveworkspacetomonitor "$1" "$2" >/dev/null 2>&1
+  fi
+}
 
 migrate_workspaces() { # migrate_workspaces <from-connector> <to-connector>
   local from="$1" to="$2" wss ids id moved=0
@@ -726,7 +843,7 @@ migrate_workspaces() { # migrate_workspaces <from-connector> <to-connector>
   ids=$(jq -r --arg m "$from" '.[] | select(.monitor == $m) | .id' <<<"$wss" 2>/dev/null) || return 0
   while IFS= read -r id; do
     [[ -n "$id" ]] || continue
-    if hyprctl dispatch moveworkspacetomonitor "$id" "$to" >/dev/null 2>&1; then
+    if move_workspace "$id" "$to"; then
       moved=$((moved + 1))
     else
       log "WARNING: failed to move workspace $id to $to"
@@ -738,17 +855,23 @@ migrate_workspaces() { # migrate_workspaces <from-connector> <to-connector>
 
 # ----------------------------------------------------------- rollback path ----
 
-snapshot_state() { # previous generated file (byte copy) + live globals (prefer_hdr, vrr)
+snapshot_state() { # previous generated files (byte copies) + live globals (prefer_hdr, vrr)
   PREV_PATH=""
+  PREV_LUA=""
   if [[ -f "$GENERATED_CONFIG" ]]; then
     PREV_PATH="${GENERATED_CONFIG}.prev.$$"
     cp -f -- "$GENERATED_CONFIG" "$PREV_PATH" || die 3 "could not snapshot the generated config"
+  fi
+  if [[ -f "$GENERATED_LUA" ]]; then
+    PREV_LUA="${GENERATED_LUA}.prev.$$"
+    cp -f -- "$GENERATED_LUA" "$PREV_LUA" || die 3 "could not snapshot the generated Lua module"
   fi
   SNAP_HDR=$(get_prefer_hdr || true)
   case "$SNAP_HDR" in
     0|1|2) ;;
     *)
       [[ -n "$PREV_PATH" ]] && rm -f -- "$PREV_PATH"
+      [[ -n "$PREV_LUA" ]] && rm -f -- "$PREV_LUA"
       die 3 "could not read quirks:prefer_hdr before mutation"
       ;;
   esac
@@ -757,45 +880,52 @@ snapshot_state() { # previous generated file (byte copy) + live globals (prefer_
     0|1|2|3) ;;
     *)
       [[ -n "$PREV_PATH" ]] && rm -f -- "$PREV_PATH"
+      [[ -n "$PREV_LUA" ]] && rm -f -- "$PREV_LUA"
       die 3 "could not read misc:vrr before mutation"
       ;;
   esac
 }
 
-restore_on_failure() { # restore persistent file + reload it, then snapshotted globals via IPC
+restore_on_failure() { # restore persistent files + reload them, then snapshotted globals via IPC
   if (( ! SRC_ACTIVE && ! TGT_WAS_ENABLED )); then
-    # Nothing was active before this apply, so the previous file is a
-    # zero-display state. Keep the new file: it at least enables the target.
+    # Nothing was active before this apply, so the previous files are a
+    # zero-display state. Keep the new files: they at least enable the target.
     log "no display was active before this apply; keeping the new generated config"
     [[ -n "$PREV_PATH" ]] && rm -f -- "$PREV_PATH"
+    [[ -n "$PREV_LUA" ]] && rm -f -- "$PREV_LUA"
     PREV_PATH=""
+    PREV_LUA=""
     return 0
   fi
+  local restored=0
   if [[ -n "$PREV_PATH" && -f "$PREV_PATH" ]]; then
-    if mv -f -- "$PREV_PATH" "$GENERATED_CONFIG"; then
-      # The restored file enables exactly its previous target, so this reload
-      # keeps one monitor active while returning live topology to the prior
-      # exclusive state; globals are reasserted through IPC after it.
-      if hyprctl reload >/dev/null 2>&1; then
-        log "restored previous generated config and reloaded it"
-      else
-        log "ERROR: reload of restored config failed; live topology may differ from the restored file"
-      fi
-    fi
+    mv -f -- "$PREV_PATH" "$GENERATED_CONFIG" && restored=1
     PREV_PATH=""
   else
     rm -f -- "$GENERATED_CONFIG"
     log "removed generated config (none existed before this apply)"
   fi
-  if hyprctl keyword misc:vrr "$SNAP_VRR" >/dev/null 2>&1; then
-    log "restored misc:vrr=$SNAP_VRR through IPC"
+  if [[ -n "$PREV_LUA" && -f "$PREV_LUA" ]]; then
+    mv -f -- "$PREV_LUA" "$GENERATED_LUA" && restored=1
+    PREV_LUA=""
   else
-    log "ERROR: failed to restore misc:vrr through IPC"
+    rm -f -- "$GENERATED_LUA"
+    log "removed generated Lua module (none existed before this apply)"
   fi
-  if hyprctl keyword quirks:prefer_hdr "$SNAP_HDR" >/dev/null 2>&1; then
-    log "restored quirks:prefer_hdr=$SNAP_HDR through IPC"
+  if (( restored )); then
+    # The restored files enable exactly their previous target, so this reload
+    # keeps one monitor active while returning live topology to the prior
+    # exclusive state; globals are reasserted through IPC after it.
+    if reload_config; then
+      log "restored previous generated config and reloaded it"
+    else
+      log "ERROR: reload of restored config failed; live topology may differ from the restored files"
+    fi
+  fi
+  if set_globals "$SNAP_VRR" "$SNAP_HDR"; then
+    log "restored misc:vrr=$SNAP_VRR and quirks:prefer_hdr=$SNAP_HDR through IPC"
   else
-    log "ERROR: failed to restore quirks:prefer_hdr through IPC"
+    log "ERROR: failed to restore misc:vrr/quirks:prefer_hdr through IPC"
   fi
 }
 
@@ -848,6 +978,7 @@ fail_apply() { # fail_apply <reason> → restore, report, exit 4
 apply_flow() { # apply_flow <role> — caller holds the lock and parsed REQ_*
   local role="$1" other_role
   other_role=$(other "$role")
+  detect_manager
 
   fetch_monitors || die 3 "discovery failed: hyprctl -j monitors all returned no valid JSON"
   discover
@@ -876,7 +1007,7 @@ apply_flow() { # apply_flow <role> — caller holds the lock and parsed REQ_*
   # 1) staging: target active with its requested settings; any active source kept.
   TARGET_ROLE="$role"
   write_generated "$role" staging
-  hyprctl reload >/dev/null 2>&1 || fail_apply "staging reload command failed"
+  reload_config || fail_apply "staging reload failed (command error or generated-module config errors)"
   apply_role_globals "$role" || fail_apply "staging global apply failed (misc:vrr/quirks:prefer_hdr)"
   wake_target_if_needed || log "WARNING: dpms wake failed; verification will catch dpms state"
   poll_verify staging_ok || fail_apply "staging verification failed: ${VT_WHY:-target not active} (observed: ${VT_OBS:-none})"
@@ -889,13 +1020,14 @@ apply_flow() { # apply_flow <role> — caller holds the lock and parsed REQ_*
 
   # 3) final: target first, non-target disabled by description; full verify.
   write_generated "$role" final
-  hyprctl reload >/dev/null 2>&1 || fail_apply "final reload command failed"
+  reload_config || fail_apply "final reload failed (command error or generated-module config errors)"
   apply_role_globals "$role" || fail_apply "final global apply failed (misc:vrr/quirks:prefer_hdr)"
   wake_target_if_needed || log "WARNING: dpms wake failed; verification will catch dpms state"
   poll_verify final_ok || fail_apply "final verification failed: ${VT_WHY:-state not converged} (observed: ${VT_OBS:-none})"
 
-  rm -f -- "${PREV_PATH:-}" 2>/dev/null
+  rm -f -- "${PREV_PATH:-}" "${PREV_LUA:-}" 2>/dev/null
   PREV_PATH=""
+  PREV_LUA=""
   log "$role mode applied and verified"
   echo "$role mode applied"
 }

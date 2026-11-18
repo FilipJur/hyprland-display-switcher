@@ -26,7 +26,7 @@ An apply targets one display and sets resolution, refresh, VRR, HDR, and scale; 
 - PipeWire, WirePlumber, ALSA, or default audio-sink management.
 - CH7218/PCON DPCD writes, DP encoder resets, FRL adapter retries, GPU DPM pinning, or sudo access.
 - Automatic fallback to 4K120, 4K60, 1080p144, 8-bit, SDR, or VRR-off operation.
-- Migrating the entire HyDE configuration from hyprlang to Lua.
+- Migrating the entire HyDE configuration from hyprlang to Lua (the applier only keeps its own generated module valid for both managers).
 - General-purpose monitor profile management for unknown hardware.
 
 ## Grounded Current State
@@ -125,7 +125,8 @@ Responsibilities:
 - Accept `status`, `caps`, `ensure`, and `monitor` / `tv` with optional `res=`, `hz=`, `vrr=`, `hdr=`, `scale=` keys.
 - Read structured monitor data with `hyprctl -j monitors all` and `jq`; never scrape human-readable output.
 - Emit only the status token for `status`, only the capabilities JSON for `caps`, and one success line for an apply. Diagnostics go to stderr and the log.
-- Write a single hyprlang `monitorv2` generated file because the deployed HyDE configuration currently sources `display-switcher-generated.conf` after `monitors.conf`.
+- Write both generated files from one resolved request: the hyprlang `monitorv2` file, because the deployed HyDE configuration currently sources `display-switcher-generated.conf` after `monitors.conf`, and the Lua module the Lua configuration requires. Both carry identical state (see Generated configuration).
+- Detect the running config manager once per mutating run and use `hyprctl keyword`/legacy `dispatch` under hyprlang, `hl.config`/`hl.dsp.*` under Lua (see Lua mode).
 - Never call sudo or modify kernel, DRM debugfs, sysfs power levels, audio state, notification daemons, wallpaper daemons, or TV settings.
 
 CLI contract:
@@ -161,7 +162,9 @@ Responsibilities:
 
 ### Generated configuration: persistent desired state
 
-`~/.config/hypr/display-switcher-generated.conf` contains the complete desired state for both displays and the request's global VRR/HDR preferences. Blocks carry mode, position, scale, and color fields, but no per-monitor `vrr` (see VRR is global only). It is generated through a temporary file in the same directory and an atomic rename. Partial files must never be visible to Hyprland.
+`~/.config/hypr/display-switcher-generated.conf` contains the complete desired state for both displays and the request's global VRR/HDR preferences. Blocks carry mode, position, scale, and color fields, but no per-monitor `vrr` (see VRR is global only). `~/.config/hypr/display-switcher-generated.lua` carries the identical state for the Lua config manager: one `hl.config({ misc = { vrr = N }, quirks = { prefer_hdr = N } })`, then the same two `hl.monitor({ ... })` calls with the same fields and values (the non-target as `disabled = true`). One request builds both texts.
+
+Each file is generated through a temporary file in the same directory, validated (block/output counts, plus `luac5.5 -p` for the Lua module when available), and atomically renamed — hyprlang first, Lua last. Partial files must never be visible to Hyprland.
 
 Use the full EDID description in persistent rules so connector renumbering does not invalidate the next reload and the Monitor selector retains its serial. These are verbatim live Hyprland 0.56.2 `description` values, not strings assembled from separate JSON fields:
 
@@ -172,7 +175,33 @@ Hyprland selectors match either a connector name or a description prefix; they c
 
 Runtime IPC, workspace migration, and verification use connector names from the current JSON snapshot.
 
-Hyprland 0.56 documents Lua as the preferred configuration format, but this machine still boots through a hyprlang/HyDE source chain. Supporting both formats caused avoidable branches and a second helper. The clean cutover supports the deployed hyprlang path only. A future whole-config Lua migration should replace it once, rather than retaining two generators indefinitely.
+### Lua mode
+
+Hyprland 0.56.2 supports two config managers, and this machine runs hyprlang while a Lua translation is staged (`hyprland.staged.lua`, loaded later as `hyprland.lua`). Rollback to hyprlang must keep working until the hyprlang files are deleted, so the applier supports both and is manager-agnostic about its persisted state: both generated files are written on every apply from one request, so the current session and a future Lua session read the same desired state. `require("display-switcher-generated")` in the Lua tree picks up the module; the hyprlang chain keeps sourcing the `.conf`.
+
+Detection runs once per mutating command, after the lock and before any mutation, with a side-effect-free `hyprctl eval 'return 1'`:
+
+| Reply | Manager |
+|---|---|
+| `ok` | `lua` |
+| contains `only supported with the lua config manager` | `hyprlang` |
+| anything else (no instance, socket error, `error: …`) | exit 3, no mutation |
+
+`status` and `caps` mutate nothing and skip detection.
+
+Manager-specific calls (hyprlang unchanged):
+
+| Operation | Lua mode |
+|---|---|
+| `hyprctl keyword misc:vrr N` / `quirks:prefer_hdr N` | one `hyprctl eval 'hl.config({ misc = { vrr = N }, quirks = { prefer_hdr = N } })'`; a reply starting with `error` fails the apply (`keyword` is refused with exit 0 under Lua and would silently do nothing) |
+| `hyprctl reload` | same command; synchronous in both managers |
+| `hyprctl configerrors` | required after every Lua reload: `reload` replies `ok` even when the Lua config raised errors, so errors mentioning the generated module fail the apply |
+| `hyprctl dispatch dpms on CONN` | `hyprctl dispatch 'hl.dsp.dpms({ action = "enable", monitor = "CONN" })'`; only a connector from the current snapshot is passed, because Hyprland #16471 makes a non-matching selector act on all monitors. `enable`/`on` and `disable`/`off` are recognised and any other string silently means `toggle`, so the action is spelled `enable` |
+| `hyprctl dispatch moveworkspacetomonitor ID CONN` | `hyprctl dispatch 'hl.dsp.workspace.move({ workspace = "ID", monitor = "CONN" })'` (old syntax is a Lua syntax error) |
+
+The explicit synchronous reload stays in Lua mode instead of relying on the config watcher: the module rename can trigger one extra asynchronous reload of the same file, which is harmless, and verification polls compositor state rather than timing. Rollback restores both files (or removes both when neither existed) and reasserts the snapshotted globals through the manager-appropriate call.
+
+When the hyprlang configuration is deleted, delete the hyprlang generation path and the `keyword` branch together; the Lua module is then the only generated file.
 
 ### `install.sh`: installation only
 
@@ -241,7 +270,7 @@ Rules:
 3. Replace arbitrary sleeps with bounded polling: poll structured state every 100 ms for up to five seconds, or fifteen when nothing was active before the switch (a target waking from a dark session can report 0×0 for several seconds).
 4. Migrate active workspaces only after the target is verified active and before disabling a connected source.
 5. The final config lists the active target rule before the disabled non-target rule.
-6. On failure, restore the previous generated file atomically **without reloading it**, then restore the snapshotted live `misc:vrr` and `quirks:prefer_hdr` values through IPC. This preserves the previous persistent and global VRR/HDR state while avoiding another risky monitor transition. Leave the live compositor with whichever one-or-two-display state still has an active output; exit nonzero with observed state. Rollback never restores a config with no active output.
+6. On failure, restore both previous generated files atomically (a file that did not exist before is removed), reload them, then restore the snapshotted live `misc:vrr` and `quirks:prefer_hdr` values through IPC. This preserves the previous persistent and global VRR/HDR state. Leave the live compositor with whichever one-or-two-display state still has an active output; exit nonzero with observed state. Rollback never restores a config with no active output.
 7. Reapplying the same settings is idempotent and still performs final verification.
 
 No retry reset loop is allowed. A second blind topology transition can hide the first failure and was needed only for the adapter.
@@ -279,8 +308,9 @@ A missing or unparseable `modetest` skips the DRM check with a single log line a
 | Requested `res`+`hz` not advertised, not a custom modeline, and not the display default | Exit 3; no mutation and no substitution |
 | Requested `vrr=1`/`hdr=1` when the display is not capable and the request differs from its default | Exit 3; no mutation |
 | `jq`/`hyprctl` unavailable or invalid JSON | Exit 3; no mutation |
-| Staging target fails verification | Restore previous generated file and live VRR/HDR preferences; leave source active; exit 4 |
-| Final state fails verification | Restore previous generated file without monitor reload, restore live VRR/HDR preferences through IPC, report all observed fields plus the DRM line; exit 4 |
+| Staging target fails verification | Restore previous generated files and live VRR/HDR preferences; leave source active; exit 4 |
+| Final state fails verification | Restore previous generated files, restore live VRR/HDR preferences through IPC, report all observed fields plus the DRM line; exit 4 |
+| Lua-mode reload reports config errors naming the generated module | Treat as a failed reload: restore previous files and globals; exit 4 |
 | Concurrent apply | Exit 5 immediately |
 | `ensure` with no known display connected | Exit 3; nothing to enable |
 | `status` reports `unknown` | Header shows no active display; defaults remain selectable |
@@ -305,7 +335,7 @@ A missing or unparseable `modetest` skips the DRM check with a single log line a
 - `src/lua-monitor-lib.sh`
 - `pw.dot`
 - Ignored `src/__pycache__/`
-- Stale generated Lua files and repository-owned deployed helper symlinks
+- Stale adapter-era generated Lua files and repository-owned deployed helper symlinks (the current `display-switcher-generated.lua` is generated at runtime, not repository-owned)
 
 Mirror/Extend branches, audio sink constants, PCON/DPCD functions, DPM functions, retry modes, fixed `DP-1`/`DP-2` role constants, six-second FRL sleeps, overlay cooldown, and daemon `pkill`/restart behavior are deleted rather than disabled.
 
@@ -330,7 +360,9 @@ The switcher must not attempt privileged bootloader or sudoers edits.
 | One applier owns status and mutation | Prevents Python and Bash topology parsers from diverging |
 | Structured JSON only | Human-readable `hyprctl` output already caused brittle detection |
 | Staged then final reload | Preserves the no-zero-monitor invariant without mixing runtime legacy rules into `monitorv2` state |
-| Hyprlang only for this cutover | Matches the deployed HyDE source chain; removes dual-format branching |
+| Dual generated output while both managers are possible | Rollback to hyprlang must keep working until the hyprlang config is deleted; one resolved request writes both files so the managers cannot diverge |
+| Explicit synchronous `hyprctl reload` in Lua mode | Verification polls compositor state; a possible extra watcher reload re-reads the same file and cannot change the outcome |
+| `configerrors` check after Lua reloads | `reload` replies `ok` even for a broken Lua config; only errors naming the generated module fail the apply |
 | No audio management | Outside the explicitly reduced display-only scope |
 | No adapter fallback code | Native HDMI removes the hardware and its failure model |
 

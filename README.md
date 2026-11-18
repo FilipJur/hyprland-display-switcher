@@ -43,15 +43,18 @@ desc:Philips Consumer Electronics Company Philips UHDTV 0x01010101
   detached, and a failure raises a `notify-send` notification titled
   `<Display> failed` with the applier's last error line.
 - Each apply atomically rewrites
-  `~/.config/hypr/display-switcher-generated.conf` (temporary file + rename,
-  so Hyprland never sees a partial config) with hyprlang `monitorv2` rules,
-  reloads, migrates workspaces to the target, and polls `hyprctl -j monitors
-  all` until the requested settings are active — resolution, refresh, scale,
-  color preset, VRR, HDR preference, and the other display disabled (10-bit
-  output is asserted for the TV). The final poll also checks the kernel's DRM
-  state (`modetest -c/-e/-p`): CRTC mode and refresh, `VRR_ENABLED`,
-  `Colorspace`, and the HDR metadata EOTF. Actual 10-bit output on the HDMI
-  link can be confirmed via the connector's `amdgpu_current_bpc` sysfs value.
+  `~/.config/hypr/display-switcher-generated.conf` and
+  `~/.config/hypr/display-switcher-generated.lua` with the same state
+  (temporary file + rename, so Hyprland never sees a partial config): the
+  hyprlang file as `monitorv2` rules, the Lua module as `hl.config` plus
+  `hl.monitor` calls. It then reloads, migrates workspaces to the target, and
+  polls `hyprctl -j monitors all` until the requested settings are active —
+  resolution, refresh, scale, color preset, VRR, HDR preference, and the other
+  display disabled (10-bit output is asserted for the TV). The final poll also
+  checks the kernel's DRM state (`modetest -c/-e/-p`): CRTC mode and refresh,
+  `VRR_ENABLED`, `Colorspace`, and the HDR metadata EOTF. Actual 10-bit output
+  on the HDMI link can be confirmed via the connector's `amdgpu_current_bpc`
+  sysfs value.
 - VRR is applied through the global `misc:vrr` only; generated display rules
   carry no `vrr`, because Hyprland 0.56.2 treats a VRR-only rule change as a
   full match and would keep a stale per-display value. A rule written by an
@@ -68,6 +71,26 @@ desc:Philips Consumer Electronics Company Philips UHDTV 0x01010101
   powered off, monitor off, or booting into saved settings whose display is
   gone), it applies the monitor's defaults if the monitor is connected, else
   the TV's defaults.
+
+### Lua mode
+
+The applier supports both Hyprland config managers while the hyprlang config
+still exists. It detects the running manager once per apply with a
+side-effect-free `hyprctl eval` (`ok` = Lua, the "only supported with the lua
+config manager" reply = hyprlang, anything else exits 3 before mutating), and
+writes both generated files every time, so a later rollback to hyprlang finds
+the same desired state.
+
+Under Lua `hyprctl keyword` is silently refused, so the global options go
+through `hyprctl eval 'hl.config({ misc = { vrr = N }, quirks = { prefer_hdr =
+N } })'`, DPMS wake through `hl.dsp.dpms({ action = "enable", monitor = CONN })`
+(only a connector from the current snapshot: a selector that matches nothing
+acts on all monitors, Hyprland #16471), and workspace migration through
+`hl.dsp.workspace.move({ workspace = "ID", monitor = "CONN" })`. After each
+reload the applier reads `hyprctl configerrors` — `reload` replies `ok` even for
+a broken Lua config — and fails the apply (rolling both files back) on errors
+that mention the generated module. Once `hyprland.conf` is deleted, delete the
+hyprlang generation path.
 
 ## Installation
 
