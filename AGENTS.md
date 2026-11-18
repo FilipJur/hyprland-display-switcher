@@ -4,7 +4,7 @@
 
 Read in order before any change:
 
-1. `ARCHITECTURE.md` — authoritative target behavior and design decisions.
+1. `ARCHITECTURE.md` — authoritative behavior and design decisions.
 2. `plan.md` — ordered gates; every gate has passed (historical record).
 3. Existing source — the implemented native-HDMI behavior; the adapter-era runtime was deleted in the cutover.
 
@@ -12,7 +12,7 @@ The baseline before architecture work is commit `607ccaae0ad4c15ebf5592b72a8530f
 
 ## Project Status
 
-Implemented and live. Both exclusive modes passed the Live Acceptance Matrix in `plan.md`, including the post-reboot run: the TV runs 3840x2160@144, 10-bit HDR (BT2020 RGB), VRR, over native HDMI FRL12; the monitor runs 3440x1440@74.98, 10-bit SDR.
+Implemented and live. The modes passed the Live Acceptance Matrix in `plan.md`, including the post-reboot run: the TV runs 3840x2160@144, 10-bit HDR (BT2020 RGB), VRR, over native HDMI FRL12; the monitor runs 3440x1440@74.98, 8-bit SDR. `cs2` and `cs2-2k` are monitor-side custom modelines with GPU Full-aspect pillarbox (patched Aquamarine required); `tv-alt` is the VRR-off TV alternative.
 
 FRL12 is reachable only because the TV VBIOS advertises `FRL_12G_EN=0` and the locally built CachyOS kernel forces FRL12 through `force_hdmi21_frl_enc_enable` for both `dcn30` and `dcn301`. See Tested Environment and Proven State.
 
@@ -20,10 +20,12 @@ The documentation cutover is complete: this file and `README.md` describe the im
 
 ## Authoritative Scope
 
-Exactly two exclusive modes:
+Five exclusive modes across two display roles:
 
-- **Monitor:** Philips PHL 345E2, 3440×1440@74.98, 10-bit SDR, scale 1.
-- **TV:** Philips 55OLED820/Philips UHDTV over native HDMI 2.1 FRL12, 3840x2160@144, 10-bit HDR (BT2020 RGB), scale 1.5, VRR enabled.
+- **Monitor (`monitor`):** Philips PHL 345E2, 3440×1440@74.98, 8-bit SDR, scale 1, VRR off.
+- **CS2 (`cs2`, `cs2-2k`):** same monitor and color treatment, custom 1920×1080 / 2560×1440 ~75 Hz modeline with GPU Full-aspect pillarbox; needs the patched Aquamarine.
+- **TV (`tv`):** Philips 55OLED820/Philips UHDTV over native HDMI 2.1 FRL12, 3840x2160@144, 10-bit HDR (BT2020 RGB), scale 1.5, VRR enabled.
+- **TV alternate (`tv-alt`):** identical to `tv` with VRR off.
 
 HDMI 2.1 FRL12 and VRR are proven on this hardware (see Tested Environment and Proven State); do not investigate or dispute them. The applier still requires the exact advertised 4K144 mode before TV-mode mutation; absence remains a fail-closed precondition, never permission to fall back.
 
@@ -31,9 +33,9 @@ HDMI 2.1 FRL12 and VRR are proven on this hardware (see Tested Environment and P
 
 1. Identify display roles from structured EDID fields and connector class; connector names are runtime data, never role constants.
 2. Enable and verify the target before disabling the source. Never create a zero-monitor state.
-3. Accept only `status`, `monitor`, and `tv` in the applier.
+3. Accept `status`, `connected`, `ensure`, and the five apply modes (`monitor`, `cs2`, `cs2-2k`, `tv`, `tv-alt`) in the applier; nothing else.
 4. Verify effective JSON state after every mutation. A successful command exit is not proof.
-5. No automatic downgrade from 4K144, 10-bit, HDR, or VRR.
+5. No automatic downgrade from 4K144, 10-bit, HDR, or VRR. `tv-alt` is a user-requested VRR-off mode, not a fallback, and `ensure` only acts when no known display is enabled.
 6. No sudo or privileged operations in project code.
 7. No audio routing, Extend, Mirror, PCON/DPCD, DPM, adapter reset, daemon-kill, or Lua-generation compatibility path.
 8. Keep `research/` unchanged as adapter-era history.
@@ -44,10 +46,11 @@ HDMI 2.1 FRL12 and VRR are proven on this hardware (see Tested Environment and P
 
 | File | Responsibility |
 |---|---|
-| `src/display_switcher.py` | GTK presentation, two-mode selection, asynchronous invocation |
-| `src/display_apply.sh` | Discovery, status, preflight, safe transition, generated config, workspace migration, verification |
-| `config/display-switcher.css` | Existing visual theme; minimal two-button layout adjustment only |
-| `monitors.conf` | EDID-based cold-start Monitor profile |
+| `src/display_switcher.py` | Terminal-style GTK presentation: active-mode header, `$ display-apply.sh` prompt, one row per mode (`monitor`, `cs2`, `tv`, `tv-alt`; `cs2-2k` is applier-only), dimmed and skipped unavailable rows, detached apply, failure notification |
+| `src/display_apply.sh` | Discovery, status/connected/ensure, preflight, safe transition, generated config, workspace migration, verification |
+| `src/display_watch.py` | Hotplug failover: socket2 `monitoradded`/`monitorremoved`, 3 s debounce, runs `ensure` at startup and after events |
+| `config/display-switcher.css` | Terminal-style theme: monospace, warm dark panel, single cyan accent |
+| `monitors.conf` | Comments plus `WAYLAND-1/2` disables; no `monitorv2` blocks (cold-boot fallback is HyDE's `monitor = ,preferred,auto,auto` in `base.conf`) |
 | `install.sh` | Symlinks, dependency checks, source-order validation, stale project-link cleanup |
 | `ARCHITECTURE.md` | Design record |
 | `plan.md` | Passed implementation and acceptance gates |
@@ -73,7 +76,7 @@ Live-verified after the kernel cutover and reboot:
 - Kernel: `7.2.2-2-cachyos` (locally rebuilt with `localmodcfg`), booted with `amdgpu.dcfeaturemask=0x402`.
 - Transport: the TV VBIOS advertises `FRL_12G_EN=0`; the kernel's `force_hdmi21_frl_enc_enable` override for both `dcn30` and `dcn301` forces HDMI 2.1 FRL12 regardless. A stock kernel rebuild silently drops the link below 4K144.
 - Proven TV state: 3840x2160@144.00, `currentFormat` `XRGB2101010` (10-bit), BT2020 RGB colorimetry, color preset `hdr`, VRR true, scale 1.5, `quirks:prefer_hdr=1`, `misc:vrr=1`.
-- Proven monitor state: 3440x1440@74.98, 10-bit, `srgb`, VRR off, `quirks:prefer_hdr=0`, `misc:vrr=0`.
+- Proven monitor state: 3440x1440@74.98, 8-bit, `srgb`, VRR off, `quirks:prefer_hdr=0`, `misc:vrr=0`.
 - Compositor: Hyprland 0.56.2.
 - Dependencies verified by `install.sh`: Bash, `hyprctl`, `jq`, Python 3, PyGObject, GTK3, gtk-layer-shell.
 
@@ -83,15 +86,20 @@ Static checks:
 
 ```bash
 bash -n src/display_apply.sh install.sh
-python3 -m py_compile src/display_switcher.py
+python3 -m py_compile src/display_switcher.py src/display_watch.py
 ```
 
 Behavioral entry points:
 
 ```bash
 src/display_apply.sh status
+src/display_apply.sh connected
+src/display_apply.sh ensure
 src/display_apply.sh monitor
+src/display_apply.sh cs2
+src/display_apply.sh cs2-2k
 src/display_apply.sh tv
+src/display_apply.sh tv-alt
 ```
 
 Live state evidence:
