@@ -134,6 +134,17 @@ if [[ ${#missing[@]} -gt 0 ]]; then
     echo "On Arch, install with your package manager: hyprland jq python python-gobject gtk3 gtk-layer-shell"
 fi
 
+# Optional capability probes for `display-apply.sh caps`. Without them caps
+# reports vrr_capable/hdr_capable as false, so preflight refuses vrr=1/hdr=1
+# requests (the tv defaults need both); everything else still applies.
+optional_missing=()
+command -v modetest >/dev/null 2>&1 || optional_missing+=("libdrm (modetest)")
+command -v di-edid-decode >/dev/null 2>&1 || optional_missing+=("libdisplay-info (di-edid-decode)")
+if [[ ${#optional_missing[@]} -gt 0 ]]; then
+    echo "NOTE: Optional capability probes missing: ${optional_missing[*]}"
+    echo "  Install libdrm and libdisplay-info to let caps probe VRR/HDR support."
+fi
+
 echo ""
 echo "Ensure this is in ~/.config/hypr/keybindings.conf:"
 echo '  bindd = $mainMod, O, Toggle display mode, exec, python3 ~/.local/bin/display-switcher.py'

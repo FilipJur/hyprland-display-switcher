@@ -2,27 +2,27 @@
 # display_apply.sh — sole display control plane for the native-HDMI switcher.
 # Authoritative behavior: ARCHITECTURE.md ("src/display_apply.sh: sole control plane").
 #
-# Modes (exclusive): monitor (PHL 345E2, 3440x1440@74.98, 8-bit SDR,
-# VRR off), cs2 (PHL 345E2, custom 1920x1080@~75 modeline, GPU pillarbox,
-# 8-bit SDR, VRR off), cs2-2k (PHL 345E2, custom 2560x1440@~75 modeline,
-# GPU pillarbox, 8-bit SDR, VRR off), and tv (Philips UHDTV on native HDMI,
-# 3840x2160@144, 10-bit HDR, VRR).
-# tv-alt is the TV timing at 3840x2160@144 with VRR off: identical mode,
-# metadata and range to tv, so the panel sees the same signal except VRR.
+# Per-display settings: `monitor` and `tv` take optional res=WxH, hz=N,
+# vrr=0|1, hdr=0|1 and scale=S keys; omitted keys fall back to that role's
+# defaults (monitor 3440x1440@74.98, 8-bit SDR, VRR off, scale 1; tv
+# 3840x2160@144, 10-bit HDR, VRR on, scale 1.5). `caps` reports what the
+# attached hardware advertises (modes, refresh rates, VRR/HDR capability,
+# scales) for the overlay to build its controls.
 # Discovery is identity-based (EDID fields + HDMI connector class); connector
-# names are runtime data only. Every apply verifies effective compositor state.
+# names are runtime data only. Every apply verifies effective compositor state
+# against the resolved request, not against a fixed profile.
 #
-# CLI:  display_apply.sh status|connected|ensure|monitor|cs2|cs2-2k|tv|tv-alt
+# CLI:  display_apply.sh status|caps|ensure|monitor|tv [key=value ...]
 # ensure: no-op while any known display is enabled; otherwise enables a
-# connected one (monitor first, then tv). Used by display_watch.py on boot
-# and hotplug so a vanished output never leaves the session dark.
-# connected: one line per connected known display (monitor, then tv), enabled
-# or not; no lock and no mutation. Used by the overlay to decide availability.
+# connected one (monitor first, then tv) with that role's defaults. Used by
+# display_watch.py on boot and hotplug so a vanished output never leaves the
+# session dark.
 # Exit: 0 success · 2 usage · 3 discovery/preflight (no mutation) ·
 #       4 apply/verification failure · 5 lock held by another apply
-# stdout: `status` token, `connected` role lines, or one success line for
+# stdout: `status` role token, one `caps` JSON object, or one success line for
 # apply. Diagnostics: stderr + log.
-# No sudo, no kernel/DRD debugfs/sysfs access, no audio, no daemon restarts.
+# No sudo, no writes to DRM/sysfs (EDID is only read), no audio, no daemon
+# restarts.
 
 set -uo pipefail
 
@@ -47,18 +47,26 @@ TV_MODEL="Philips UHDTV"
 MONITOR_DESC="desc:Philips Consumer Electronics Company PHL 345E2 UK02226037640"
 TV_DESC="desc:Philips Consumer Electronics Company Philips UHDTV 0x01010101"
 
-# Profiles: single source of truth for generation AND verification.
-# Patched Aquamarine emits DRM scaling mode=Full aspect(3), so non-native
-# modes center with side bars instead of stretching. CS2 is 1920x1080@~75
-# (upscaled full-height to 2560x1440 by the GPU); CS2 2K is native 2560x1440@~75.
-MONITOR_PROFILE="mode=3440x1440@74.98 position=0x0 scale=1 bitdepth=8 cm=srgb sdr_eotf=srgb sdrsaturation=1.2 vrr=0"
-TV_PROFILE="mode=3840x2160@144 position=0x0 scale=1.5 bitdepth=10 cm=hdr sdrbrightness=3.0 sdrsaturation=1.0 sdr_min_luminance=0 sdr_max_luminance=200 min_luminance=0 max_luminance=1400 max_avg_luminance=250 supports_hdr=1 supports_wide_color=1 vrr=1"
-# TV_ALT_PROFILE: byte-for-byte TV_PROFILE with one change — vrr 1->0.
-TV_ALT_PROFILE="mode=3840x2160@144 position=0x0 scale=1.5 bitdepth=10 cm=hdr sdrbrightness=3.0 sdrsaturation=1.0 sdr_min_luminance=0 sdr_max_luminance=200 min_luminance=0 max_luminance=1400 max_avg_luminance=250 supports_hdr=1 supports_wide_color=1 vrr=0"
+# Per-role settings defaults. `caps` publishes these as "defaults"; an apply
+# that omits a key uses them.
+MON_DEF_RES="3440x1440" MON_DEF_HZ="74.98" MON_DEF_VRR=0 MON_DEF_HDR=0 MON_DEF_SCALE="1"
+TV_DEF_RES="3840x2160" TV_DEF_HZ="144" TV_DEF_VRR=1 TV_DEF_HDR=1 TV_DEF_SCALE="1.5"
+# Scale factors the overlay offers; preflight rejects anything else.
+SCALES="1 1.25 1.5 2"
+
+# Color bases: role + hdr decides bit depth, preset and HDR metadata. The tv
+# HDR base carries the calibrated SDR-to-HDR mapping. Monitor HDR is not a
+# defined composition, so hdr=1 is refused for the monitor in preflight.
+MON_SDR_COLOR="bitdepth=8 cm=srgb sdr_eotf=srgb sdrsaturation=1.2"
+TV_HDR_COLOR="bitdepth=10 cm=hdr sdrbrightness=3.0 sdrsaturation=1.0 sdr_min_luminance=0 sdr_max_luminance=200 min_luminance=0 max_luminance=1400 max_avg_luminance=250 supports_hdr=1 supports_wide_color=1"
+TV_SDR_COLOR="bitdepth=10 cm=srgb sdr_eotf=srgb sdrsaturation=1.0"
+
+# Monitor-only custom modelines (GPU Full aspect pillarbox, needs patched
+# Aquamarine); published by `caps` as extra rates for their resolution.
 CS2_MODELINE="modeline 220.75 1920 2056 2264 2608 1080 1083 1088 1130 -hsync +vsync"
-CS2_PROFILE="position=0x0 scale=1 bitdepth=8 cm=srgb sdr_eotf=srgb sdrsaturation=1.2 vrr=0"
+CS2_HZ="74.65"
 CS2_2K_MODELINE="modeline 397.25 2560 2760 3040 3520 1440 1443 1448 1506 -hsync +vsync"
-CS2_2K_PROFILE="position=0x0 scale=1 bitdepth=8 cm=srgb sdr_eotf=srgb sdrsaturation=1.2 vrr=0"
+CS2_2K_HZ="74.89"
 POLL_INTERVAL=0.1   # seconds between polls
 POLL_MAX=50         # bounded: 50 checks at 100 ms ≈ five seconds
 
@@ -70,6 +78,11 @@ TV_PRESENT=0 TV_ENABLED=0 TV_CONN=""
 TARGET_ROLE="" SRC_ACTIVE=0 SRC_CONN="" TGT_CONN="" TGT_WAS_ENABLED=0
 VT_WHY="" VT_OBS=""
 PREV_PATH="" LAST_TMP="" SNAP_HDR="" SNAP_VRR=""
+# Resolved request for the current apply (see parse_request/preflight_request).
+REQ_ROLE="" REQ_RES="" REQ_W="" REQ_H="" REQ_HZ="" REQ_VRR="" REQ_HDR="" REQ_SCALE=""
+REQ_BITDEPTH="" REQ_CM=""
+# One cached `modetest -c` dump per run (read-only connector properties).
+MODETEST_OUT="" MODETEST_TRIED=0
 
 # ------------------------------------------------------------------- logging --
 
@@ -86,25 +99,23 @@ die() { # die <exit-code> <message...>
 
 usage() {
   cat >&2 <<'EOF'
-usage: display-apply.sh <command>
+usage: display-apply.sh <command> [key=value ...]
 commands:
-  connected print the connected known displays, one role per line: monitor
-            then tv, enabled or not; nothing when none is connected (no
-            lock, no mutation)
+  status    print the active role: monitor, tv or unknown
+  caps      print the attached displays' capabilities as one JSON object
+            (modes, refresh rates, VRR/HDR support, scales, current state);
+            no lock, no mutation
   ensure    no-op while any known display is enabled; otherwise enable a
-            connected one: monitor first, then tv
-  monitor   apply the PHL 345E2 profile: 3440x1440@74.98, 8-bit SDR, VRR
-            off, scale 1
-  cs2       apply the PHL 345E2 CS2 profile: custom 1920x1080@~75
-            modeline, 8-bit SDR, VRR off, scale 1 (GPU Full aspect
-            pillarbox, needs patched Aquamarine)
-  cs2-2k    apply the PHL 345E2 CS2 2K profile: custom 2560x1440@~75
-            modeline, 8-bit SDR, VRR off, scale 1 (GPU Full aspect
-            pillarbox, needs patched Aquamarine)
-  tv        apply the Philips UHDTV profile on native HDMI:
-            3840x2160@144, 10-bit HDR, VRR, scale 1.5 (no fallback)
-  tv-alt    apply the Philips UHDTV alternate profile:
-            3840x2160@144, 10-bit HDR, VRR OFF, scale 1.5
+            connected one with its defaults: monitor first, then tv
+  monitor   apply settings to the PHL 345E2:
+              monitor [res=WxH] [hz=N] [vrr=0|1] [hdr=0|1] [scale=S]
+            defaults: res=3440x1440 hz=74.98 vrr=0 hdr=0 scale=1
+  tv        apply settings to the Philips UHDTV on native HDMI:
+              tv [res=WxH] [hz=N] [vrr=0|1] [hdr=0|1] [scale=S]
+            defaults: res=3840x2160 hz=144 vrr=1 hdr=1 scale=1.5
+custom monitor modes (select with res= + hz=, no extra key):
+  1920x1080@74.65  modeline, GPU Full aspect pillarbox
+  2560x1440@74.89  modeline, GPU Full aspect pillarbox
 exit codes: 0 success · 2 usage · 3 discovery/preflight (no mutation) ·
 4 apply/verify · 5 lock
 EOF
@@ -150,7 +161,7 @@ fetch_monitors() { # one structured snapshot; sets MONITORS_JSON
 
 role_match() { # role_match <role> <snapshot-json> → JSON array of matches
   local role="$1" json="$2"
-  if [[ "$role" == monitor || "$role" == cs2 || "$role" == cs2-2k ]]; then
+  if [[ "$role" == monitor ]]; then
     jq -c --arg make "$MON_MAKE" --arg model "$MON_MODEL" --arg serial "$MON_SERIAL" \
       '[ .[] | select(.make == $make and .model == $model and .serial == $serial) ]' <<<"$json"
   else
@@ -188,102 +199,240 @@ discover() {
   fi
 }
 
-role_present() {
-  [[ "$1" == monitor || "$1" == cs2 || "$1" == cs2-2k ]] && echo "$MON_PRESENT" || echo "$TV_PRESENT"
-}
-role_enabled() {
-  [[ "$1" == monitor || "$1" == cs2 || "$1" == cs2-2k ]] && echo "$MON_ENABLED" || echo "$TV_ENABLED"
-}
-role_conn() {
-  [[ "$1" == monitor || "$1" == cs2 || "$1" == cs2-2k ]] && echo "$MON_CONN" || echo "$TV_CONN"
-}
-selector() {
-  [[ "$1" == tv ]] && echo "$TV_DESC" || echo "$MONITOR_DESC"
-}
-other() {
-  [[ "$1" == tv ]] && echo monitor || echo tv
-}
-pref_for() { # prefer_hdr for a role; tv-alt is tv, so canonicalize first
-  [[ "$(tv_role "$1")" == tv ]] && echo 1 || echo 0
-}
-# tv-alt shares the tv role identity (same panel, same connector match) and
-# only selects the alternate profile. Centralizes the alias so verify_target,
-# globals, status and rollback all stay consistent.
-tv_role() { # tv_role <role> → canonical role for identity/globals
-  [[ "$1" == tv-alt ]] && echo tv || echo "$1"
-}
+role_present() { [[ "$1" == tv ]] && echo "$TV_PRESENT" || echo "$MON_PRESENT"; }
+role_enabled() { [[ "$1" == tv ]] && echo "$TV_ENABLED" || echo "$MON_ENABLED"; }
+role_conn()    { [[ "$1" == tv ]] && echo "$TV_CONN" || echo "$MON_CONN"; }
+role_json()    { [[ "$1" == tv ]] && printf '%s' "$TV_ARR" || printf '%s' "$MON_ARR"; }
+selector()     { [[ "$1" == tv ]] && echo "$TV_DESC" || echo "$MONITOR_DESC"; }
+other()        { [[ "$1" == tv ]] && echo monitor || echo tv; }
 
-compute_status() {
+compute_status() { # active role only; both or neither enabled is unknown
   if (( TV_PRESENT && TV_ENABLED )) && ! (( MON_PRESENT && MON_ENABLED )); then
-    # tv and tv-alt share the 144 Hz timing; VRR is the discriminator.
-    local _vrr
-    _vrr=$(jq -r '.[0].vrr // empty' <<<"$TV_ARR" 2>/dev/null)
-    if [[ "$_vrr" == "true" ]]; then printf 'tv\n'; else printf 'tv-alt\n'; fi
+    printf 'tv\n'
   elif (( MON_PRESENT && MON_ENABLED )) && ! (( TV_PRESENT && TV_ENABLED )); then
-    local width height
-    width=$(jq -r '.[0].width' <<<"$MON_ARR")
-    height=$(jq -r '.[0].height' <<<"$MON_ARR")
-    if [[ "$width" == 1920 && "$height" == 1080 ]]; then
-      printf 'cs2\n'
-    elif [[ "$width" == 2560 && "$height" == 1440 ]]; then
-      printf 'cs2-2k\n'
-    else
-      printf 'monitor\n'
-    fi
+    printf 'monitor\n'
   else
     printf 'unknown\n'
   fi
 }
 
-prof() { # prof <role> <key> → value from the single profile definition
-  local profile kv
-  profile=$(prof_all "$1") || return 1
-  if [[ "$1" == cs2 && "$2" == mode ]]; then
-    printf '%s' "$CS2_MODELINE"
-    return 0
+# ------------------------------------------------------- resolved request ----
+
+default_setting() { # default_setting <role> <res|hz|vrr|hdr|scale>
+  local p v
+  if [[ "$1" == tv ]]; then p=TV_DEF; else p=MON_DEF; fi
+  case "$2" in
+    res) v="${p}_RES" ;;
+    hz) v="${p}_HZ" ;;
+    vrr) v="${p}_VRR" ;;
+    hdr) v="${p}_HDR" ;;
+    scale) v="${p}_SCALE" ;;
+    *) return 1 ;;
+  esac
+  printf '%s' "${!v}"
+}
+
+setting() { # setting <role> <key>: request value for the target role, else its default
+  if [[ "$1" == "$REQ_ROLE" ]]; then
+    case "$2" in
+      res) printf '%s' "$REQ_RES"; return 0 ;;
+      hz) printf '%s' "$REQ_HZ"; return 0 ;;
+      vrr) printf '%s' "$REQ_VRR"; return 0 ;;
+      hdr) printf '%s' "$REQ_HDR"; return 0 ;;
+      scale) printf '%s' "$REQ_SCALE"; return 0 ;;
+    esac
   fi
-  if [[ "$1" == cs2-2k && "$2" == mode ]]; then
-    printf '%s' "$CS2_2K_MODELINE"
-    return 0
+  default_setting "$1" "$2"
+}
+
+color_base() { # color_base <role> <hdr 0|1> → color profile key/value string
+  if [[ "$1" == tv ]]; then
+    if [[ "$2" == 1 ]]; then printf '%s' "$TV_HDR_COLOR"; else printf '%s' "$TV_SDR_COLOR"; fi
+  else
+    printf '%s' "$MON_SDR_COLOR"
   fi
-  for kv in $profile; do
-    if [[ "$kv" == "$2="* ]]; then
-      printf '%s' "${kv#*=}"
-      return 0
-    fi
+}
+
+color_kv() { # color_kv <role> <hdr> <key> → value from that color base
+  local kv
+  for kv in $(color_base "$1" "$2"); do
+    if [[ "$kv" == "$3="* ]]; then printf '%s' "${kv#*=}"; return 0; fi
   done
   return 1
+}
+
+custom_modeline() { # custom_modeline <res> <hz> → monitor-only custom modeline
+  if [[ "$1" == "1920x1080" ]] && refresh_close "$2" "$CS2_HZ"; then
+    printf '%s' "$CS2_MODELINE"
+  elif [[ "$1" == "2560x1440" ]] && refresh_close "$2" "$CS2_2K_HZ"; then
+    printf '%s' "$CS2_2K_MODELINE"
+  else
+    return 1
+  fi
+}
+
+mode_for() { # mode_for <role> <res> <hz> → mode string for the generated config
+  local ml
+  if [[ "$1" == monitor ]] && ml=$(custom_modeline "$2" "$3"); then
+    printf '%s' "$ml"
+  else
+    printf '%s@%s' "$2" "$3"
+  fi
+}
+
+req_error() { # req_error <message> → usage error, exit 2
+  log "ERROR(2): $*"
+  usage
+}
+
+parse_request() { # parse_request <role> [key=value ...] → REQ_*; exit 2 on bad usage
+  local role="$1" arg k v
+  shift
+  REQ_ROLE="$role"
+  REQ_RES="" REQ_HZ="" REQ_VRR="" REQ_HDR="" REQ_SCALE=""
+  for arg in "$@"; do
+    [[ "$arg" == *=* ]] || req_error "malformed argument '$arg' (expected key=value)"
+    k="${arg%%=*}"
+    v="${arg#*=}"
+    case "$k" in
+      res)
+        [[ -z "$REQ_RES" ]] || req_error "duplicate key res"
+        [[ "$v" =~ ^[0-9]+x[0-9]+$ ]] || req_error "malformed res '$v' (want WxH)"
+        REQ_RES="$v"
+        ;;
+      hz)
+        [[ -z "$REQ_HZ" ]] || req_error "duplicate key hz"
+        [[ "$v" =~ ^[0-9]+(\.[0-9]+)?$ ]] || req_error "malformed hz '$v' (want a number)"
+        REQ_HZ="$v"
+        ;;
+      vrr)
+        [[ -z "$REQ_VRR" ]] || req_error "duplicate key vrr"
+        [[ "$v" == 0 || "$v" == 1 ]] || req_error "malformed vrr '$v' (want 0 or 1)"
+        REQ_VRR="$v"
+        ;;
+      hdr)
+        [[ -z "$REQ_HDR" ]] || req_error "duplicate key hdr"
+        [[ "$v" == 0 || "$v" == 1 ]] || req_error "malformed hdr '$v' (want 0 or 1)"
+        REQ_HDR="$v"
+        ;;
+      scale)
+        [[ -z "$REQ_SCALE" ]] || req_error "duplicate key scale"
+        [[ "$v" =~ ^[0-9]+(\.[0-9]+)?$ ]] || req_error "malformed scale '$v' (want a number)"
+        REQ_SCALE="$v"
+        ;;
+      *)
+        req_error "unknown key '$k'"
+        ;;
+    esac
+  done
+  REQ_RES="${REQ_RES:-$(default_setting "$role" res)}"
+  REQ_HZ="${REQ_HZ:-$(default_setting "$role" hz)}"
+  REQ_VRR="${REQ_VRR:-$(default_setting "$role" vrr)}"
+  REQ_HDR="${REQ_HDR:-$(default_setting "$role" hdr)}"
+  REQ_SCALE="${REQ_SCALE:-$(default_setting "$role" scale)}"
+  REQ_W="${REQ_RES%x*}"
+  REQ_H="${REQ_RES#*x}"
+  REQ_BITDEPTH=$(color_kv "$role" "$REQ_HDR" bitdepth)
+  REQ_CM=$(color_kv "$role" "$REQ_HDR" cm)
+}
+
+mode_advertised() { # mode_advertised <role-arr-json> <w> <h> <hz> (±0.1 Hz)
+  jq -e --arg res "$2x$3" --argjson hz "$4" '
+    [ .[0].availableModes[]?
+      | capture("^(?<res>[0-9]+x[0-9]+)@(?<hz>[0-9.]+)Hz$")
+      | {res, hz: (.hz | tonumber)}
+    ]
+    | any(.res == $res and ((.hz - $hz) as $d | if $d < 0 then -$d else $d end) <= 0.1)
+  ' <<<"$1" >/dev/null 2>&1
+}
+
+# ------------------------------------------------------ hardware capability ---
+
+load_modetest() { # cache one read-only connector property dump for this run
+  (( MODETEST_TRIED )) && return 0
+  MODETEST_TRIED=1
+  MODETEST_OUT=""
+  command -v modetest >/dev/null 2>&1 || return 0
+  MODETEST_OUT=$(timeout 10 modetest -c 2>/dev/null) || MODETEST_OUT=""
+}
+
+vrr_capable() { # vrr_capable <connector> → true|false; false when unreadable
+  local conn="$1" val
+  load_modetest
+  [[ -n "$MODETEST_OUT" ]] || { echo false; return 0; }
+  val=$(awk -v want="$conn" '
+    $3 == "connected" || $3 == "disconnected" { inconn = ($4 == want); seen = 0; next }
+    inconn && $1 ~ /^[0-9]+$/ && $2 == "vrr_capable:" { seen = 1; next }
+    inconn && seen && $1 == "value:" { print $2; exit }
+  ' <<<"$MODETEST_OUT")
+  [[ "$val" == 1 ]] && echo true || echo false
+}
+
+hdr_capable() { # hdr_capable <connector> → true|false from that connector's EDID
+  local conn="$1" f out
+  command -v di-edid-decode >/dev/null 2>&1 || { echo false; return 0; }
+  f=$(ls /sys/class/drm/card*-"$conn"/edid 2>/dev/null | head -1)
+  [[ -n "$f" ]] || { echo false; return 0; }
+  # di-edid-decode exits non-zero on EDID warnings, so match the decoded text
+  # instead of relying on its (pipefail-sensitive) pipeline status.
+  out=$(di-edid-decode "$f" 2>/dev/null || true)
+  if [[ "$out" == *"SMPTE ST2084"* ]]; then
+    echo true
+  else
+    echo false
+  fi
+}
+
+preflight_request() { # validate REQ_* before any write; exit 3 on failure
+  local role="$REQ_ROLE" conn s ok
+  conn=$(role_conn "$role")
+  ok=0
+  for s in $SCALES; do
+    if num_close "$REQ_SCALE" "$s"; then ok=1; break; fi
+  done
+  (( ok )) || die 3 "scale $REQ_SCALE is not supported (allowed: $SCALES)"
+  if [[ "$role" == monitor ]] && custom_modeline "$REQ_RES" "$REQ_HZ" >/dev/null; then
+    :
+  elif mode_advertised "$(role_json "$role")" "$REQ_W" "$REQ_H" "$REQ_HZ"; then
+    :
+  elif [[ "$REQ_RES" == "$(default_setting "$role" res)" ]] &&
+       refresh_close "$REQ_HZ" "$(default_setting "$role" hz)"; then
+    # The shipped default is a live-verified request even when Hyprland does
+    # not list it (the TV's 3840x2160@144 is absent while it is disabled).
+    :
+  else
+    die 3 "$role has no advertised mode ${REQ_RES}@${REQ_HZ} (±0.1 Hz)"
+  fi
+  # Optional probes (modetest/di-edid-decode) must never block a role's own
+  # default or a failover: only an upgrade over that default is gated.
+  if [[ "$REQ_VRR" == 1 && "$REQ_VRR" != "$(default_setting "$role" vrr)" ]]; then
+    [[ "$(vrr_capable "$conn")" == true ]] || die 3 "$conn does not report vrr_capable=1"
+  fi
+  if [[ "$REQ_HDR" == 1 && "$REQ_HDR" != "$(default_setting "$role" hdr)" ]]; then
+    [[ "$role" == tv ]] || die 3 "hdr=1 is not defined for the monitor"
+    [[ "$(hdr_capable "$conn")" == true ]] || die 3 "$conn EDID does not advertise HDR (SMPTE ST2084)"
+  fi
 }
 
 emit_block() { # emit_block <role> <selector> <position-override> <disabled 0|1>
   local role="$1" sel="$2" pos="$3" dis="$4" kv k v
   printf 'monitorv2 {\n'
   printf '    output = %s\n' "$sel"
-  printf '    position = %s\n' "${pos:-$(prof "$role" position)}"
-  printf '    mode = %s\n' "$(prof "$role" mode)"
-  for kv in $(prof_all "$role"); do
+  printf '    position = %s\n' "${pos:-0x0}"
+  printf '    mode = %s\n' "$(mode_for "$role" "$(setting "$role" res)" "$(setting "$role" hz)")"
+  printf '    scale = %s\n' "$(setting "$role" scale)"
+  for kv in $(color_base "$role" "$(setting "$role" hdr)"); do
     k="${kv%%=*}"
     v="${kv#*=}"
     case "$k" in
-      position|mode) continue ;;
-      scale|bitdepth|cm|sdr_eotf|sdrbrightness|sdrsaturation|sdr_min_luminance|sdr_max_luminance|min_luminance|max_luminance|max_avg_luminance|supports_hdr|supports_wide_color|vrr)
+      bitdepth|cm|sdr_eotf|sdrbrightness|sdrsaturation|sdr_min_luminance|sdr_max_luminance|min_luminance|max_luminance|max_avg_luminance|supports_hdr|supports_wide_color)
         printf '    %s = %s\n' "$k" "$v" ;;
-      *) die 4 "internal error: unknown profile key '$k'" ;;
+      *) die 4 "internal error: unknown color key '$k'" ;;
     esac
   done
+  printf '    vrr = %s\n' "$(setting "$role" vrr)"
   (( dis )) && printf '    disabled = 1\n'
   printf '}\n'
-}
-
-prof_all() { # role → profile string (helper for word-split iteration)
-  case "$1" in
-    monitor) echo "$MONITOR_PROFILE" ;;
-    cs2) echo "$CS2_PROFILE" ;;
-    cs2-2k) echo "$CS2_2K_PROFILE" ;;
-    tv) echo "$TV_PROFILE" ;;
-    tv-alt) echo "$TV_ALT_PROFILE" ;;
-    *) return 1 ;;
-  esac
 }
 
 # Generated file: role-dependent globals first (misc:vrr, quirks:prefer_hdr)
@@ -292,17 +441,16 @@ prof_all() { # role → profile string (helper for word-split iteration)
 # file, validated, then atomically renamed.
 write_generated() { # write_generated <target-role> <staging|final>
   local role="$1" kind="$2" tmp blocks outs
-  local other_role pref vrr canon
-  canon=$(tv_role "$role")
-  other_role=$(other "$canon")
-  pref=$(pref_for "$canon")
-  vrr=$(prof "$role" vrr)
+  local other_role pref vrr
+  other_role=$(other "$role")
+  pref=$(setting "$role" hdr)
+  vrr=$(setting "$role" vrr)
   tmp="${GENERATED_CONFIG}.tmp.$$"
   LAST_TMP="$tmp"
   {
     printf 'misc {\n    vrr = %s\n}\n' "$vrr"
     printf 'quirks {\n    prefer_hdr = %s\n}\n' "$pref"
-    emit_block "$role" "$(selector "$canon")" "" 0
+    emit_block "$role" "$(selector "$role")" "" 0
     if [[ "$kind" == staging && "$SRC_ACTIVE" == 1 ]]; then
       # Keep the connected, active source at a non-overlapping position.
       emit_block "$other_role" "$(selector "$other_role")" "auto-right" 0
@@ -339,28 +487,17 @@ get_prefer_hdr() { get_option_val quirks:prefer_hdr; }
 get_misc_vrr()   { get_option_val misc:vrr; }
 
 verify_target() { # verify_target <role> <snapshot-json>; sets VT_WHY/VT_OBS
-  local role="$1" json="$2" arr n conn mode w h r canon
+  local role="$1" json="$2" arr n conn
+  local disabled width height rr scale fmt cm vrr dpms want_vrr
   VT_WHY=""
-  canon=$(tv_role "$role")
-  arr=$(role_match "$canon" "$json") || { VT_WHY="identity query failed"; return 1; }
+  arr=$(role_match "$role" "$json") || { VT_WHY="identity query failed"; return 1; }
   n=$(jq 'length' <<<"$arr")
   (( n == 1 )) || { VT_WHY="$role identity matches=$n (need exactly 1)"; return 1; }
   conn=$(jq -r '.[0].name' <<<"$arr")
-  if [[ "$canon" == tv && ! "$conn" =~ ^HDMI-A- ]]; then
+  if [[ "$role" == tv && ! "$conn" =~ ^HDMI-A- ]]; then
     VT_WHY="tv is on non-HDMI connector $conn"
     return 1
   fi
-  mode=$(prof "$role" mode)
-  if [[ "$mode" =~ ^modeline[[:space:]]+[0-9.]+[[:space:]]+2560[[:space:]] ]]; then
-    w=2560; h=1440; r=74.89
-  elif [[ "$mode" =~ ^modeline[[:space:]]+[0-9.]+[[:space:]]+1920[[:space:]] ]]; then
-    w=1920; h=1080; r=74.65
-  elif [[ "$mode" =~ ^([0-9]+)x([0-9]+)@([0-9]+(\.[0-9]+)?)$ ]]; then
-    w=${BASH_REMATCH[1]} h=${BASH_REMATCH[2]} r=${BASH_REMATCH[3]}
-  else
-    VT_WHY="bad profile mode '$mode'"; return 1
-  fi
-  local disabled width height rr scale fmt cm vrr dpms
   disabled=$(jq -r '.[0].disabled' <<<"$arr")
   width=$(jq -r '.[0].width' <<<"$arr")
   height=$(jq -r '.[0].height' <<<"$arr")
@@ -373,37 +510,33 @@ verify_target() { # verify_target <role> <snapshot-json>; sets VT_WHY/VT_OBS
   VT_OBS="$conn: disabled=$disabled ${width}x${height}@${rr} scale=$scale fmt=$fmt cm=$cm vrr=$vrr dpms=$dpms"
   [[ "$disabled" == "false" ]] || { VT_WHY="$conn is disabled"; return 1; }
   [[ "$dpms" == "true" ]] || { VT_WHY="$conn dpms is off"; return 1; }
-  (( width == w && height == h )) || { VT_WHY="mode ${width}x${height} != ${w}x${h}"; return 1; }
-  refresh_close "$rr" "$r" || { VT_WHY="refresh $rr not within 0.1 Hz of $r"; return 1; }
-  num_close "$scale" "$(prof "$role" scale)" || { VT_WHY="scale $scale != $(prof "$role" scale)"; return 1; }
-  if [[ "$(prof "$role" bitdepth)" == "10" ]]; then
+  (( width == REQ_W && height == REQ_H )) || { VT_WHY="mode ${width}x${height} != ${REQ_W}x${REQ_H}"; return 1; }
+  refresh_close "$rr" "$REQ_HZ" || { VT_WHY="refresh $rr not within 0.1 Hz of $REQ_HZ"; return 1; }
+  num_close "$scale" "$REQ_SCALE" || { VT_WHY="scale $scale != $REQ_SCALE"; return 1; }
+  if [[ "$REQ_BITDEPTH" == "10" ]]; then
     case "$fmt" in
       XRGB2101010|XBGR2101010|ARGB2101010) ;;
       *) VT_WHY="currentFormat $fmt is not 10-bit"; return 1 ;;
     esac
   fi
-  [[ "$cm" == "$(prof "$role" cm)" ]] || { VT_WHY="cm $cm != $(prof "$role" cm)"; return 1; }
-  local want_vrr
-  want_vrr=$([[ "$(prof "$role" vrr)" == "1" ]] && echo true || echo false)
+  [[ "$cm" == "$REQ_CM" ]] || { VT_WHY="cm $cm != $REQ_CM"; return 1; }
+  want_vrr=$([[ "$REQ_VRR" == "1" ]] && echo true || echo false)
   [[ "$vrr" == "$want_vrr" ]] || { VT_WHY="vrr $vrr != $want_vrr"; return 1; }
   return 0
 }
-verify_final() { # verify_final <role> <snapshot-json>: target profile + non-target off + global vrr/HDR prefs
+verify_final() { # verify_final <role> <snapshot-json>: request + non-target off + global prefs
   verify_target "$@" || return 1
-  local role="$1" canon oarr on odis hdr want vrr
-  canon=$(tv_role "$role")
-  oarr=$(role_match "$(other "$canon")" "$2") || { VT_WHY="non-target query failed"; return 1; }
+  local role="$1" oarr on odis hdr want vrr
+  oarr=$(role_match "$(other "$role")" "$2") || { VT_WHY="non-target query failed"; return 1; }
   on=$(jq 'length' <<<"$oarr")
   if (( on > 0 )); then
     odis=$(jq -r '.[0].disabled' <<<"$oarr")
-    [[ "$odis" == "true" ]] || { VT_WHY="$(other "$canon") is still enabled"; return 1; }
+    [[ "$odis" == "true" ]] || { VT_WHY="$(other "$role") is still enabled"; return 1; }
   fi
   hdr=$(get_prefer_hdr) || { VT_WHY="quirks:prefer_hdr unreadable"; return 1; }
-  want=$(pref_for "$canon")
-  (( hdr == want )) || { VT_WHY="quirks:prefer_hdr=$hdr != $want"; return 1; }
+  (( hdr == REQ_HDR )) || { VT_WHY="quirks:prefer_hdr=$hdr != $REQ_HDR"; return 1; }
   vrr=$(get_misc_vrr) || { VT_WHY="misc:vrr unreadable"; return 1; }
-  want=$(prof "$role" vrr)
-  (( vrr == want )) || { VT_WHY="misc:vrr=$vrr != $want"; return 1; }
+  (( vrr == REQ_VRR )) || { VT_WHY="misc:vrr=$vrr != $REQ_VRR"; return 1; }
   return 0
 }
 
@@ -426,10 +559,10 @@ poll_verify() { # poll_verify <predicate-fn>: check every 100 ms, at most 5 s
   return 1
 }
 
-apply_role_globals() { # reassert role-dependent globals through IPC after each reload
+apply_role_globals() { # reassert the requested globals through IPC after each reload
   local role="$1" want_vrr want_pref
-  want_vrr=$(prof "$role" vrr) # global misc:vrr required value: tv=1, monitor=0
-  want_pref=$(pref_for "$role")
+  want_vrr=$(setting "$role" vrr)
+  want_pref=$(setting "$role" hdr)
   hyprctl keyword misc:vrr "$want_vrr" >/dev/null 2>&1 || return 1
   hyprctl keyword quirks:prefer_hdr "$want_pref" >/dev/null 2>&1 || return 1
 }
@@ -563,11 +696,9 @@ fail_apply() { # fail_apply <reason> → restore, report, exit 4
 
 # --------------------------------------------------------------- transaction --
 
-apply_flow() { # apply_flow <role> — caller holds the lock
+apply_flow() { # apply_flow <role> — caller holds the lock and parsed REQ_*
   local role="$1" other_role
-  # tv-alt is tv with a different profile: identity/presence/global lookups
-  # always run against the canonical role; only prof() sees the mode id.
-  other_role=$(other "$(tv_role "$role")")
+  other_role=$(other "$role")
 
   fetch_monitors || die 3 "discovery failed: hyprctl -j monitors all returned no valid JSON"
   discover
@@ -575,6 +706,8 @@ apply_flow() { # apply_flow <role> — caller holds the lock
   local present
   present=$(role_present "$role")
   (( present == 1 )) || die 3 "$role target not connected or not uniquely identified"
+  # The requested mode and capabilities must hold before anything is written.
+  preflight_request
 
   TGT_CONN=$(role_conn "$role")
   SRC_ACTIVE=0
@@ -589,9 +722,9 @@ apply_flow() { # apply_flow <role> — caller holds the lock
   (( SRC_ACTIVE || TGT_WAS_ENABLED )) || POLL_MAX=150
 
   snapshot_state
-  log "applying $role mode (target=$TGT_CONN, source=$( ((SRC_ACTIVE)) && echo "$SRC_CONN" || echo none ))"
+  log "applying $role ${REQ_RES}@${REQ_HZ} vrr=$REQ_VRR hdr=$REQ_HDR scale=$REQ_SCALE (target=$TGT_CONN, source=$( ((SRC_ACTIVE)) && echo "$SRC_CONN" || echo none ))"
 
-  # 1) staging: target active with its final profile; any active source kept.
+  # 1) staging: target active with its requested settings; any active source kept.
   TARGET_ROLE="$role"
   write_generated "$role" staging
   hyprctl reload >/dev/null 2>&1 || fail_apply "staging reload command failed"
@@ -634,7 +767,106 @@ ensure_flow() { # ensure_flow — caller holds the lock
     die 3 "no known display connected"
   fi
   log "no active display; failing over to $role"
+  parse_request "$role"
   apply_flow "$role"
+}
+
+# -------------------------------------------------------------------- caps ---
+
+modes_json() { # modes_json <availableModes> <extra-rates> <def-res> <def-hz>
+  jq -c --argjson extra "$2" --arg dres "$3" --argjson dhz "$4" '
+    ( [ .[]?
+        | capture("^(?<res>[0-9]+x[0-9]+)@(?<hz>[0-9.]+)Hz$")
+        | {res, hz: (((.hz | tonumber) * 100 | round) / 100)}
+      ]
+      + $extra
+      + [{res: $dres, hz: $dhz}]
+    )
+    | group_by(.res)
+    | map({
+        res: .[0].res,
+        rates: (
+          group_by(.hz)
+          | map((([.[] | select(has("custom"))][0]) // .[0]) | del(.res))
+          | sort_by(-.hz)
+        )
+      })
+    | sort_by(.res | split("x") | map(tonumber) | (.[0] * .[1]))
+    | reverse
+  ' <<<"$1"
+}
+
+display_caps_json() { # display_caps_json <role> → one caps display object
+  local role="$1" arr present conn transport enabled vrr hdr modes current extras
+  arr=$(role_json "$role")
+  present=$(jq 'length' <<<"$arr")
+  conn=""; transport=""; enabled=0; vrr=false; hdr=false; modes='[]'; current='null'
+  extras='[]'
+  if (( present )); then
+    conn=$(jq -r '.[0].name' <<<"$arr")
+    enabled=$(jq -r 'if .[0].disabled == false then 1 else 0 end' <<<"$arr")
+    vrr=$(vrr_capable "$conn")
+    hdr=$(hdr_capable "$conn")
+    if [[ "$role" == monitor ]]; then
+      extras=$(printf '[{"res":"1920x1080","hz":%s,"custom":"cs2"},{"res":"2560x1440","hz":%s,"custom":"cs2-2k"}]' "$CS2_HZ" "$CS2_2K_HZ")
+    fi
+    modes=$(modes_json "$(jq -c '.[0].availableModes // []' <<<"$arr")" \
+      "$extras" "$(default_setting "$role" res)" "$(default_setting "$role" hz)")
+    if (( enabled )); then
+      current=$(jq -c '.[0] | {
+        res: "\(.width)x\(.height)",
+        hz: ((.refreshRate * 100 | round) / 100),
+        vrr: .vrr,
+        hdr: (.colorManagementPreset == "hdr"),
+        scale: .scale
+      }' <<<"$arr")
+    fi
+    if [[ "$conn" == HDMI-A-* ]]; then
+      transport="HDMI"
+    elif [[ "$conn" == DP-* ]]; then
+      transport="DP"
+    else
+      transport="${conn%-*}"
+    fi
+  fi
+  jq -nc \
+    --arg role "$role" \
+    --arg device "$([[ "$role" == tv ]] && echo "$TV_MODEL" || echo "$MON_MODEL")" \
+    --arg conn "$conn" \
+    --arg transport "$transport" \
+    --argjson enabled "$enabled" \
+    --argjson vrr "$vrr" \
+    --argjson hdr "$hdr" \
+    --argjson modes "$modes" \
+    --argjson current "$current" \
+    --arg scales "$SCALES" \
+    --arg dres "$(default_setting "$role" res)" \
+    --argjson dhz "$(default_setting "$role" hz)" \
+    --argjson dvrr "$([[ "$(default_setting "$role" vrr)" == 1 ]] && echo true || echo false)" \
+    --argjson dhdr "$([[ "$(default_setting "$role" hdr)" == 1 ]] && echo true || echo false)" \
+    --argjson dscale "$(default_setting "$role" scale)" \
+    '{
+      role: $role,
+      device: $device,
+      connector: (if $conn == "" then null else $conn end),
+      transport: (if $transport == "" then null else $transport end),
+      connected: ($conn != ""),
+      enabled: ($enabled == 1),
+      vrr_capable: $vrr,
+      hdr_capable: $hdr,
+      modes: $modes,
+      scales: ($scales | split(" ") | map(tonumber)),
+      defaults: {res: $dres, hz: $dhz, vrr: $dvrr, hdr: $dhdr, scale: $dscale},
+      current: $current
+    }'
+}
+
+caps_flow() { # both displays, monitor first
+  local mon tv
+  mon=$(display_caps_json monitor)
+  tv=$(display_caps_json tv)
+  jq -nc --arg active "$(compute_status)" --argjson mon "$mon" --argjson tv "$tv" \
+    '{active: $active, displays: [$mon, $tv]}'
 }
 
 # --------------------------------------------------------------------- main ---
@@ -643,36 +875,39 @@ main() {
   mkdir -p "$STATE_DIR" "$CONFIG_DIR"
   trap cleanup EXIT
 
-  (( $# == 1 )) || usage
+  (( $# >= 1 )) || usage
   case "$1" in
     status)
+      (( $# == 1 )) || usage
       require_deps
       ensure_ipc_sig
       fetch_monitors || die 3 "discovery failed: hyprctl -j monitors all returned no valid JSON"
       discover
       compute_status
       ;;
-    connected)
-      # Snapshot only: no lock, no mutation, no output beyond role lines.
+    caps)
+      (( $# == 1 )) || usage
       require_deps
       ensure_ipc_sig
       fetch_monitors || die 3 "discovery failed: hyprctl -j monitors all returned no valid JSON"
       discover
-      (( MON_PRESENT )) && echo monitor
-      (( TV_PRESENT )) && echo tv
-      exit 0
-      ;;
-    monitor|cs2|cs2-2k|tv|tv-alt)
-      require_deps
-      ensure_ipc_sig
-      acquire_lock
-      apply_flow "$1"
+      caps_flow
       ;;
     ensure)
+      (( $# == 1 )) || usage
       require_deps
       ensure_ipc_sig
       acquire_lock
       ensure_flow
+      ;;
+    monitor|tv)
+      local cmd="$1"
+      shift
+      parse_request "$cmd" "$@"
+      require_deps
+      ensure_ipc_sig
+      acquire_lock
+      apply_flow "$cmd"
       ;;
     *)
       usage
