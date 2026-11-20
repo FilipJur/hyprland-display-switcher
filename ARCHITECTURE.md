@@ -125,9 +125,9 @@ Responsibilities:
 - Accept `status`, `caps`, `ensure`, and `monitor` / `tv` with optional `res=`, `hz=`, `vrr=`, `hdr=`, `scale=` keys.
 - Read structured monitor data with `hyprctl -j monitors all` and `jq`; never scrape human-readable output.
 - Emit only the status token for `status`, only the capabilities JSON for `caps`, and one success line for an apply. Diagnostics go to stderr and the log.
-- Write both generated files from one resolved request: the hyprlang `monitorv2` file, because the deployed HyDE configuration currently sources `display-switcher-generated.conf` after `monitors.conf`, and the Lua module the Lua configuration requires. Both carry identical state (see Generated configuration).
+- Generate equivalent per-session display rules in hyprlang and Lua. Lua TV profiles also include a guard against being reapplied in a new compositor instance.
 - Detect the running config manager once per mutating run and use `hyprctl keyword`/legacy `dispatch` under hyprlang, `hl.config`/`hl.dsp.*` under Lua (see Lua mode).
-- Never call sudo or modify kernel, DRM debugfs, sysfs power levels, audio state, notification daemons, wallpaper daemons, or TV settings.
+- Never call sudo or modify kernel, DRM debugfs, sysfs power levels, audio state, notification daemons, or wallpaper daemons. Only an explicit TV apply may request network wake.
 
 CLI contract:
 
@@ -135,7 +135,7 @@ CLI contract:
 |---|---|---|
 | `display_apply.sh status` | `monitor`, `tv`, or `unknown` | 0; 3 on discovery failure |
 | `display_apply.sh caps` | one JSON object describing both displays | 0; 3 on discovery failure or ambiguity |
-| `display_apply.sh ensure` | concise success or no-op line | 0; no-op while any known display is enabled, else applies `monitor` then `tv` defaults |
+| `display_apply.sh ensure` | concise success or no-op line | 0; prefers the monitor and only selects an already-awake TV |
 | `display_apply.sh monitor [key=value ...]` | concise success line | 0 only after final verification |
 | `display_apply.sh tv [key=value ...]` | concise success line | 0 only after final verification |
 | Invalid/missing command | usage | 2 |
@@ -149,6 +149,8 @@ Preflight (exit 3, before any write or reload): the target is connected and uniq
 
 The default resolution and refresh are accepted even when the display does not advertise them (a disabled TV drops 4K144 from `availableModes`), and `caps` merges that default into `modes`. The `vrr`/`hdr` capability gates apply only when the request differs from the display default, so optional probes never block defaults or failover.
 
+The TV power gate runs before any generated config write. Explicit TV selection calls `tv_control.py wake`, rechecks HDMI discovery and settings, then requires the TV to accept `tv_control.py hdmi1`. Automatic failover requires `tv_control.py state` to report `on` and does not send wake or input commands. `caps` adds `power` (`on`, `standby`, `unknown`, or null if not a connected TV).
+
 `caps` returns one object: `active` plus both displays in order, each with `device`, `connector`, `transport`, `connected`, `enabled`, `vrr_capable`, `hdr_capable`, `modes` (resolution plus rates, custom modelines merged, and the `scales` valid at that resolution), `defaults`, and `current`. A disconnected display reports null connector/transport and `current`, empty `modes`, and false capabilities; `hdr_capable` and `vrr_capable` come from read-only probes (`di-edid-decode`, `modetest`) and degrade to false when a tool is missing.
 
 ### `src/display_watch.py`: failover watcher
@@ -158,11 +160,13 @@ Responsibilities:
 - Run from Hyprland `exec-once` after the startup reload; also run once at startup so saved settings whose display is gone recover.
 - Listen on Hyprland socket2 for `monitoradded` and `monitorremoved`, debounce 3 s, then run `display_apply.sh ensure`.
 - Retry after 2 s when the applier lock is held (exit 5).
-- Never switch away from a working display: `ensure` is a no-op while any known display is enabled.
+- Poll while only the TV is active. With a monitor connected, `ensure` returns to it on standby or after three failed power checks spaced 2 s apart. Any `on` response cancels recovery; deep standby and sustained network failure are indistinguishable.
 
 ### Generated configuration: persistent desired state
 
 `~/.config/hypr/display-switcher-generated.conf` contains the complete desired state for both displays and the request's global VRR/HDR preferences. Blocks carry mode, position, scale, and color fields, but no per-monitor `vrr` (see VRR is global only). `~/.config/hypr/display-switcher-generated.lua` carries the identical state for the Lua config manager: one `hl.config({ misc = { vrr = N }, quirks = { prefer_hdr = N } })`, then the same two `hl.monitor({ ... })` calls with the same fields and values (the non-target as `disabled = true`). One request builds both texts.
+
+In Lua mode, a generated TV profile returns without applying rules when the current Hyprland instance signature differs from the one that generated it. The base monitor module must disable the TV before loading the profile; only a confirmed TV apply may override that base rule. Generated Lua rules set `disabled` explicitly on both outputs because `hl.monitor` merges rules with the same selector. Legacy hyprlang remains unguarded at config load.
 
 Each file is generated through a temporary file in the same directory, validated (block/output counts, plus `luac5.5 -p` for the Lua module when available), and atomically renamed — hyprlang first, Lua last. Partial files must never be visible to Hyprland.
 

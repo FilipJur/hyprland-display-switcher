@@ -63,14 +63,16 @@ desc:Philips Consumer Electronics Company Philips UHDTV 0x01010101
 - Fail-closed: a non-default mode must be advertised (or be a custom monitor
   modeline), and unsupported VRR/HDR or scale exits nonzero before changing
   topology. Reapplying the same settings is idempotent.
-- Failover: `display_watch.py` listens to Hyprland's event socket and, 3 s
-  after monitor hotplug events settle (and once at startup), runs
-  `display_apply.sh ensure`. It retries 2 s later if the applier lock is held
-  (exit 5). While any known display is enabled it does nothing, so a working
-  display is never switched away from. When none is enabled (TV unplugged or
-  powered off, monitor off, or booting into saved settings whose display is
-  gone), it applies the monitor's defaults if the monitor is connected, else
-  the TV's defaults.
+- Failover prefers the connected monitor. It selects the TV only after
+  authenticated power state reports `On` and never wakes it automatically.
+  The watcher checks at startup, after a 3 s hotplug debounce, and every 8 s
+  in TV mode. If the active TV reports standby or fails to report power
+  state three times (2 s apart), it returns to the monitor when connected.
+  Deep standby and a sustained network outage are indistinguishable.
+  If the applier lock is held, the watcher retries after 2 s.
+- Explicit TV selection tries network wake, waits for `On`, and requests HDMI 1
+  before changing any PC display settings. If wake or input selection fails,
+  the overlay notifies and leaves the current PC output unchanged.
 
 ### Lua mode
 
@@ -92,6 +94,19 @@ a broken Lua config — and fails the apply (rolling both files back) on errors
 that mention the generated module. Once `hyprland.conf` is deleted, delete the
 hyprlang generation path.
 
+For a fail-closed Lua startup, add this rule to the base monitor module before
+loading the generated profile:
+
+```lua
+hl.monitor({ output = "desc:Philips Consumer Electronics Company Philips UHDTV 0x01010101", disabled = true })
+```
+
+Generated TV profiles are scoped to their compositor instance. Fresh logins
+start on the base monitor rules and let the watcher recover to an awake TV
+only when needed. A previously generated TV profile must be regenerated
+with the new applier before it has that guard. Legacy hyprlang profiles do
+not support this startup guard.
+
 ## Installation
 
 ```bash
@@ -107,6 +122,13 @@ Dependencies: Bash, `hyprctl` (Hyprland), `jq`, Python 3, PyGObject, GTK3,
 gtk-layer-shell. Optional capability probes: `modetest` (libdrm) and
 `di-edid-decode` (libdisplay-info), used by `caps`; without them VRR/HDR
 controls are hidden.
+
+With the TV on, run `python3 src/tv_control.py pair-request`, then run
+`python3 src/tv_control.py pair-grant PIN` with the PIN shown on the TV.
+Pairing discovery uses `avahi-browse`; the paired IP and credentials are
+stored in `~/.config/display-switcher/tv.json` (0600). Use a stable TV IP
+(e.g. a DHCP reservation). Enable **Switch On with Wi-Fi (WoWLAN)** in the
+TV's network settings for wake from supported standby states.
 
 Add the keybinding to `~/.config/hypr/keybindings.conf`:
 
@@ -171,7 +193,8 @@ Manual control:
 
 - `src/display_switcher.py` — cold blue-black terminal GTK overlay: per-display frames (`MONITOR`/`TV`) with device/transport, `ACTIVE`/`SDR` tags, `RESOLUTION`/`REFRESH`/`VRR`/`HDR`/`SCALE` rows from `caps`, remembered settings, detached apply with failure notification
 - `src/display_apply.sh` — discovery, `status`/`caps`/`ensure`, request preflight, atomic generated config, safe transition, workspace migration, verification
-- `src/display_watch.py` — hotplug watcher: runs `display_apply.sh ensure` on boot and monitor add/remove
+- `src/display_watch.py` — startup, HDMI hotplug, and active-TV standby watcher
+- `src/tv_control.py` — authenticated JointSpace pairing, power query, and network wake
 - `config/display-switcher.css` — cold blue-black terminal theme in Martian Mono: tracked uppercase chrome, italic hints
 - `monitors.conf` — comments plus `WAYLAND-1/2` disables only; the cold-boot fallback is HyDE's `monitor = ,preferred,auto,auto` in `base.conf`, and the generated file selects the outputs
 - `install.sh` — symlinks, dependency checks, source-order validation

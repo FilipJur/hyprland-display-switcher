@@ -216,13 +216,13 @@ class DisplayView(Gtk.Frame):
 
         self.set_label_widget(legend)
 
-        if (
-            display is not None
-            and display.get("connected")
-            and not display.get("hdr_capable")
-        ):
-            self.legend_note.set_text("SDR")
-            self.legend_note.set_visible(True)
+        if display and display.get("connected"):
+            note = {"standby": "STANDBY", "unknown": "POWER UNKNOWN"}.get(display.get("power"))
+            if note is None and not display.get("hdr_capable"):
+                note = "SDR"
+            if note:
+                self.legend_note.set_text(note)
+                self.legend_note.set_visible(True)
 
         body = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4)
         body.set_name("frame-body")
