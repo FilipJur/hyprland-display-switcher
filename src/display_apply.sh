@@ -36,6 +36,7 @@ LOCK_FILE="$STATE_DIR/display-apply.lock"
 CONFIG_DIR="$HOME/.config/hypr"
 GENERATED_CONFIG="$CONFIG_DIR/display-switcher-generated.conf"
 GENERATED_LUA="$CONFIG_DIR/display-switcher-generated.lua"
+TV_CONFIG="$HOME/.config/display-switcher/tv.json"  # tv_control.py pairing
 
 # Role identity. Monitor: exact make/model/serial. TV: HDMI connector class
 # plus exact make/model; the dummy serial 0x01010101 is not identity.
@@ -1002,25 +1003,27 @@ apply_flow() { # apply_flow <role> <explicit|automatic>; caller holds the lock
   fetch_monitors || die 3 "discovery failed: hyprctl -j monitors all returned no valid JSON"
   discover
 
-  local present
+  local present i
+  if [[ "$role" == tv && "$origin" == explicit ]]; then
+    # A TV that is fully off drops HDMI hotplug, so wake it before discovery.
+    tv_control wake ||
+      die 3 "TV did not report On; turn it on with the remote and try again"
+    tv_control hdmi1 ||
+      die 3 "could not select TV HDMI 1; check the TV and try again"
+    for ((i = 0; i < 30; i++)); do
+      fetch_monitors || die 3 "display discovery failed after TV wake"
+      discover
+      (( TV_PRESENT )) && break
+      sleep 0.5
+    done
+  fi
   present=$(role_present "$role")
   (( present == 1 )) || die 3 "$role target not connected or not uniquely identified"
   # The requested mode and capabilities must hold before anything is written.
   preflight_request
-  if [[ "$role" == tv ]]; then
-    if [[ "$origin" == automatic ]]; then
-      [[ "$(tv_control state)" == on ]] ||
-        die 3 "TV power is not confirmed On; automatic failover will not wake it"
-    else
-      tv_control wake ||
-        die 3 "TV did not report On; turn it on with the remote and try again"
-      fetch_monitors || die 3 "display discovery failed after TV wake"
-      discover
-      (( TV_PRESENT )) || die 3 "TV HDMI target is no longer connected"
-      preflight_request
-      tv_control hdmi1 ||
-        die 3 "could not select TV HDMI 1; check the TV and try again"
-    fi
+  if [[ "$role" == tv && "$origin" == automatic ]]; then
+    [[ "$(tv_control state)" == on ]] ||
+      die 3 "TV power is not confirmed On; automatic failover will not wake it"
   fi
 
   TGT_CONN=$(role_conn "$role")
@@ -1143,7 +1146,7 @@ modes_json() { # modes_json <availableModes> <extra-rates> <def-res> <def-hz> <s
 }
 
 display_caps_json() { # display_caps_json <role> → one caps display object
-  local role="$1" arr present conn transport enabled vrr hdr modes current extras power=""
+  local role="$1" arr present conn transport enabled vrr hdr modes current extras power="" wakeable=false
   arr=$(role_json "$role")
   present=$(jq 'length' <<<"$arr")
   conn=""; transport=""; enabled=0; vrr=false; hdr=false; modes='[]'; current='null'
@@ -1176,12 +1179,17 @@ display_caps_json() { # display_caps_json <role> → one caps display object
       transport="${conn%-*}"
     fi
   fi
+  # A TV that is fully off drops HDMI; when paired, an explicit apply wakes it.
+  if [[ "$role" == tv ]] && (( ! present )) && [[ -s "$TV_CONFIG" ]]; then
+    wakeable=true
+  fi
   jq -nc \
     --arg role "$role" \
     --arg device "$([[ "$role" == tv ]] && echo "$TV_MODEL" || echo "$MON_MODEL")" \
     --arg conn "$conn" \
     --arg transport "$transport" \
     --arg power "$power" \
+    --argjson wakeable "$wakeable" \
     --argjson enabled "$enabled" \
     --argjson vrr "$vrr" \
     --argjson hdr "$hdr" \
@@ -1199,6 +1207,7 @@ display_caps_json() { # display_caps_json <role> → one caps display object
       transport: (if $transport == "" then null else $transport end),
       power: (if $power == "" then null else $power end),
       connected: ($conn != ""),
+      wakeable: $wakeable,
       enabled: ($enabled == 1),
       vrr_capable: $vrr,
       hdr_capable: $hdr,

@@ -70,9 +70,12 @@ desc:Philips Consumer Electronics Company Philips UHDTV 0x01010101
   state three times (2 s apart), it returns to the monitor when connected.
   Deep standby and a sustained network outage are indistinguishable.
   If the applier lock is held, the watcher retries after 2 s.
-- Explicit TV selection tries network wake, waits for `On`, and requests HDMI 1
-  before changing any PC display settings. If wake or input selection fails,
-  the overlay notifies and leaves the current PC output unchanged.
+- Explicit TV selection tries network wake, waits for `On`, requests HDMI 1,
+  and waits up to 15 s for HDMI to reconnect before changing any PC display
+  settings. A paired TV that is fully off (HDMI gone) still appears in the
+  overlay as `POWER off · enter wakes it` and applies its remembered settings.
+  If wake or input selection fails, the overlay notifies and leaves the
+  current PC output unchanged.
 
 ### Lua mode
 

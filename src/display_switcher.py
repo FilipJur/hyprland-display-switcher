@@ -398,7 +398,18 @@ class DisplaySwitcher(Gtk.Window):
                 self.views[role] = view
                 self.frames_box.pack_start(view, False, False, 0)
                 if not display.get("connected"):
-                    view.set_note("not connected")
+                    view.settings = (
+                        self.wake_settings(display)
+                        if display.get("wakeable")
+                        else None
+                    )
+                    if view.settings is None:
+                        view.set_note("not connected")
+                        continue
+                    # HDMI is gone while the TV is off; the applier wakes it
+                    # and validates these settings once HDMI reconnects.
+                    view.add_row("power", "POWER", False, self.label_size_group)
+                    self.focus_rows.append((role, "power"))
                     continue
                 view.settings = self.resolve_settings(display)
                 for key in self.build_rows(view):
@@ -486,6 +497,25 @@ class DisplaySwitcher(Gtk.Window):
             "hdr": bool(candidate.get("hdr")) and bool(display.get("hdr_capable")),
             "scale": matched_scale,
         }
+
+    def wake_settings(self, display: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+        """Remembered (else default) settings for a TV that is off: its modes
+        and capabilities are unknown until it wakes, so they are not filtered."""
+        for candidate in (self.remembered.get(display.get("role")), display.get("defaults")):
+            if (
+                isinstance(candidate, dict)
+                and isinstance(candidate.get("res"), str)
+                and isinstance(candidate.get("hz"), (int, float))
+                and isinstance(candidate.get("scale"), (int, float))
+            ):
+                return {
+                    "res": candidate["res"],
+                    "hz": candidate["hz"],
+                    "vrr": bool(candidate.get("vrr")),
+                    "hdr": bool(candidate.get("hdr")),
+                    "scale": candidate["scale"],
+                }
+        return None
 
     def fallback_settings(self, display: Dict[str, Any]) -> Dict[str, Any]:
         modes = display.get("modes") or []
@@ -617,6 +647,8 @@ class DisplaySwitcher(Gtk.Window):
             return "[x]" if settings.get(key) else "[ ]"
         if key == "scale":
             return format_scale(settings["scale"])
+        if key == "power":
+            return "off · enter wakes it"
         return ""
 
     def change_value(self, delta: int):
